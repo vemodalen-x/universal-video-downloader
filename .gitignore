@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.spec
+.venv/
+venv/
+.m3u8_resume/
+.youtube_resume/
+.direct_resume/
+*.part
+*.ytdl
+*.temp
