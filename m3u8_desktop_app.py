@@ -25,12 +25,16 @@ from m3u8_core import (
 )
 
 
-class M3U8DesktopApp(tk.Tk):
+APP_NAME = "Universal Video Downloader"
+APP_TITLE = "通用视频下载器"
+
+
+class UniversalVideoDownloaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("M3U8 Downloader")
-        self.geometry("1180x900")
-        self.minsize(1060, 820)
+        self.title(APP_NAME)
+        self.geometry("1240x900")
+        self.minsize(1120, 820)
         self._apply_window_icon()
 
         self.ui_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
@@ -42,14 +46,15 @@ class M3U8DesktopApp(tk.Tk):
         self.last_progress_bytes = 0
         self.last_progress_time = time.time()
 
-        default_dir = Path.home() / "Downloads" / "M3U8视频"
+        default_dir = Path.home() / "Downloads" / "Video Downloader"
         self.url_var = tk.StringVar()
         self.referer_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(default_dir))
-        self.file_name_var = tk.StringVar(value="video.ts")
+        self.file_name_var = tk.StringVar(value="video.mp4")
         self.concurrency_var = tk.IntVar(value=8)
         self.keep_cache_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="准备就绪")
+        self.selection_var = tk.StringVar(value="粘贴链接后解析可下载媒体")
 
         self._configure_style()
         self._build_ui()
@@ -85,6 +90,7 @@ class M3U8DesktopApp(tk.Tk):
         style.configure("CardText.TLabel", background="#FFFFFF", foreground="#1D1D1F", font=chinese_font)
         style.configure("Muted.TLabel", background="#FFFFFF", foreground="#6E6E73", font=caption_font)
         style.configure("Pill.TLabel", background="#E9F2FF", foreground="#0067D1", font=("Segoe UI", 9, "bold"), padding=(10, 4))
+        style.configure("Tag.TLabel", background="#E8E8ED", foreground="#3A3A3C", font=("Segoe UI", 8, "bold"), padding=(8, 3))
 
         style.configure(
             "TEntry",
@@ -149,9 +155,13 @@ class M3U8DesktopApp(tk.Tk):
 
         title_box = ttk.Frame(header, style="Header.TFrame")
         title_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(title_box, text="M3U8 Downloader", style="Title.TLabel").pack(anchor=tk.W)
-        ttk.Label(title_box, text="本地下载器", style="Caption.TLabel").pack(anchor=tk.W, pady=(2, 0))
-        ttk.Label(header, text="就绪", style="Pill.TLabel").pack(side=tk.RIGHT, pady=(8, 0))
+        ttk.Label(title_box, text=APP_TITLE, style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(title_box, text="本地媒体下载与续传工作台", style="Caption.TLabel").pack(anchor=tk.W, pady=(2, 0))
+        support_row = ttk.Frame(title_box, style="Header.TFrame")
+        support_row.pack(anchor=tk.W, pady=(8, 0))
+        for label in ("HLS / m3u8", "MP4 / WebM", "YouTube", "无 DRM 绕过"):
+            ttk.Label(support_row, text=label, style="Tag.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(header, text="研究版", style="Pill.TLabel").pack(side=tk.RIGHT, pady=(8, 0))
 
         content = ttk.Frame(root, style="Chrome.TFrame")
         content.pack(fill=tk.BOTH, expand=True, pady=(22, 0))
@@ -163,24 +173,24 @@ class M3U8DesktopApp(tk.Tk):
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
 
-        ttk.Label(left, text="来源", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(left, text="网页或 m3u8", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(12, 6))
+        ttk.Label(left, text="输入", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(left, text="视频页面、m3u8、mp4/webm 或 YouTube 链接", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(12, 6))
         ttk.Entry(left, textvariable=self.url_var).grid(row=2, column=0, sticky=tk.EW)
 
         source_actions = ttk.Frame(left, style="Panel.TFrame")
         source_actions.grid(row=3, column=0, sticky=tk.EW, pady=(12, 0))
         source_actions.columnconfigure(0, weight=1)
         source_actions.columnconfigure(1, weight=1)
-        ttk.Button(source_actions, text="粘贴", command=self._paste_url).grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
-        self.analyze_button = ttk.Button(source_actions, text="分析", style="Accent.TButton", command=self._start_analyze)
+        ttk.Button(source_actions, text="粘贴链接", command=self._paste_url).grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
+        self.analyze_button = ttk.Button(source_actions, text="解析媒体", style="Accent.TButton", command=self._start_analyze)
         self.analyze_button.grid(row=0, column=1, sticky=tk.EW)
 
-        ttk.Label(left, text="Referer", style="Muted.TLabel").grid(row=4, column=0, sticky=tk.W, pady=(12, 6))
+        ttk.Label(left, text="请求来源 Referer（可选）", style="Muted.TLabel").grid(row=4, column=0, sticky=tk.W, pady=(12, 6))
         ttk.Entry(left, textvariable=self.referer_var).grid(row=5, column=0, sticky=tk.EW)
 
         tk.Frame(left, bg="#E5E5EA", height=1).grid(row=6, column=0, sticky=tk.EW, pady=16)
-        ttk.Label(left, text="保存", style="CardTitle.TLabel").grid(row=7, column=0, sticky=tk.W)
-        ttk.Label(left, text="保存目录", style="Muted.TLabel").grid(row=8, column=0, sticky=tk.W, pady=(12, 6))
+        ttk.Label(left, text="输出", style="CardTitle.TLabel").grid(row=7, column=0, sticky=tk.W)
+        ttk.Label(left, text="保存位置", style="Muted.TLabel").grid(row=8, column=0, sticky=tk.W, pady=(12, 6))
         output_row = ttk.Frame(left, style="Panel.TFrame")
         output_row.grid(row=9, column=0, sticky=tk.EW)
         output_row.columnconfigure(0, weight=1)
@@ -191,28 +201,28 @@ class M3U8DesktopApp(tk.Tk):
         ttk.Entry(left, textvariable=self.file_name_var).grid(row=11, column=0, sticky=tk.EW)
 
         tk.Frame(left, bg="#E5E5EA", height=1).grid(row=12, column=0, sticky=tk.EW, pady=16)
-        ttk.Label(left, text="选项", style="CardTitle.TLabel").grid(row=13, column=0, sticky=tk.W)
+        ttk.Label(left, text="网络与续传", style="CardTitle.TLabel").grid(row=13, column=0, sticky=tk.W)
         option_row = ttk.Frame(left, style="Panel.TFrame")
         option_row.grid(row=14, column=0, sticky=tk.EW, pady=(12, 0))
         option_row.columnconfigure(1, weight=1)
-        ttk.Label(option_row, text="并发", style="CardText.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        ttk.Label(option_row, text="并发任务", style="CardText.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
         ttk.Spinbox(option_row, from_=1, to=32, textvariable=self.concurrency_var, width=8).grid(row=0, column=1, sticky=tk.W)
-        ttk.Checkbutton(left, text="保留断点缓存", variable=self.keep_cache_var).grid(row=15, column=0, sticky=tk.W, pady=(14, 0))
+        ttk.Checkbutton(left, text="保留续传缓存", variable=self.keep_cache_var).grid(row=15, column=0, sticky=tk.W, pady=(14, 0))
 
         left.rowconfigure(16, weight=1)
         action_block = ttk.Frame(left, style="Panel.TFrame")
         action_block.grid(row=17, column=0, sticky=tk.EW, pady=(12, 0))
         action_block.columnconfigure(0, weight=1)
         action_block.columnconfigure(1, weight=1)
-        self.start_button = ttk.Button(action_block, text="开始下载", style="Accent.TButton", command=self._start_download, state=tk.DISABLED)
+        self.start_button = ttk.Button(action_block, text="下载选中媒体", style="Accent.TButton", command=self._start_download, state=tk.DISABLED)
         self.start_button.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
         self.pause_button = ttk.Button(action_block, text="暂停", command=self._toggle_pause, state=tk.DISABLED)
         self.pause_button.grid(row=1, column=0, sticky=tk.EW, padx=(0, 8), pady=(10, 0))
         self.stop_button = ttk.Button(action_block, text="停止", style="Danger.TButton", command=self._stop_download, state=tk.DISABLED)
         self.stop_button.grid(row=1, column=1, sticky=tk.EW, pady=(10, 0))
-        self.partial_button = ttk.Button(action_block, text="合并已完成", command=self._combine_partial, state=tk.DISABLED)
+        self.partial_button = ttk.Button(action_block, text="合并已完成部分", command=self._combine_partial, state=tk.DISABLED)
         self.partial_button.grid(row=2, column=0, sticky=tk.EW, padx=(0, 8), pady=(10, 0))
-        ttk.Button(action_block, text="打开目录", command=self._open_output_dir).grid(row=2, column=1, sticky=tk.EW, pady=(10, 0))
+        ttk.Button(action_block, text="打开保存位置", command=self._open_output_dir).grid(row=2, column=1, sticky=tk.EW, pady=(10, 0))
 
         right = ttk.Frame(content, style="Chrome.TFrame")
         right.grid(row=0, column=1, sticky=tk.NSEW)
@@ -224,34 +234,37 @@ class M3U8DesktopApp(tk.Tk):
         candidates_frame = ttk.Frame(right, style="Card.TFrame", padding=16)
         candidates_frame.grid(row=0, column=0, sticky=tk.EW)
         candidates_frame.columnconfigure(0, weight=1)
-        ttk.Label(candidates_frame, text="候选视频", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
-        self.best_button = ttk.Button(candidates_frame, text="自动选择最佳", command=self._select_best_candidate, state=tk.DISABLED)
+        ttk.Label(candidates_frame, text="可下载媒体", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        self.best_button = ttk.Button(candidates_frame, text="选择推荐项", command=self._select_best_candidate, state=tk.DISABLED)
         self.best_button.grid(row=0, column=1, sticky=tk.E)
 
-        columns = ("title", "resolution", "bandwidth", "segments", "duration", "encrypted", "url")
+        ttk.Label(candidates_frame, textvariable=self.selection_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        columns = ("title", "kind", "resolution", "bandwidth", "structure", "duration", "engine", "url")
         self.candidate_tree = ttk.Treeview(candidates_frame, columns=columns, show="headings", height=6, selectmode="browse")
         headings = {
-            "title": ("名称", 220),
-            "resolution": ("清晰度", 90),
-            "bandwidth": ("码率", 90),
-            "segments": ("分片", 70),
+            "title": ("媒体", 220),
+            "kind": ("类型", 82),
+            "resolution": ("画质", 82),
+            "bandwidth": ("码率", 86),
+            "structure": ("结构", 92),
             "duration": ("时长", 90),
-            "encrypted": ("加密", 70),
-            "url": ("地址", 360),
+            "engine": ("引擎", 82),
+            "url": ("来源地址", 360),
         }
         for key, (text, width) in headings.items():
             self.candidate_tree.heading(key, text=text)
             self.candidate_tree.column(key, width=width, minwidth=50, stretch=(key in {"title", "url"}))
         tree_scroll = ttk.Scrollbar(candidates_frame, orient=tk.VERTICAL, command=self.candidate_tree.yview)
         self.candidate_tree.configure(yscrollcommand=tree_scroll.set)
-        self.candidate_tree.grid(row=1, column=0, columnspan=2, sticky=tk.NSEW, pady=(10, 0))
-        tree_scroll.grid(row=1, column=2, sticky=tk.NS, pady=(10, 0))
+        self.candidate_tree.grid(row=2, column=0, columnspan=2, sticky=tk.NSEW, pady=(10, 0))
+        tree_scroll.grid(row=2, column=2, sticky=tk.NS, pady=(10, 0))
         self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_file_name_from_selection())
 
         progress_frame = ttk.Frame(right, style="Card.TFrame", padding=16)
         progress_frame.grid(row=1, column=0, sticky=tk.EW, pady=(16, 0))
         progress_frame.columnconfigure(0, weight=1)
-        ttk.Label(progress_frame, text="进度", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(progress_frame, text="任务进度", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
         self.progress = ttk.Progressbar(progress_frame, mode="determinate", maximum=100)
         self.progress.grid(row=1, column=0, sticky=tk.EW, pady=(14, 0))
         ttk.Label(progress_frame, textvariable=self.status_var, style="Muted.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
@@ -266,7 +279,7 @@ class M3U8DesktopApp(tk.Tk):
         log_frame.grid(row=2, column=0, sticky=tk.NSEW, pady=(16, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
-        ttk.Label(log_frame, text="活动", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(log_frame, text="任务日志", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
         self.log_text = ScrolledText(log_frame, height=8, wrap=tk.WORD, borderwidth=0, font=("Cascadia Mono", 9))
         self.log_text.grid(row=1, column=0, sticky=tk.NSEW, pady=(10, 0))
         self.log_text.configure(bg="#F8F8FA", fg="#2C2C2E", insertbackground="#2C2C2E", relief=tk.FLAT, padx=10, pady=10)
@@ -292,11 +305,13 @@ class M3U8DesktopApp(tk.Tk):
     def _start_analyze(self) -> None:
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showwarning("缺少地址", "请先输入网页地址或 m3u8 地址。")
+            messagebox.showwarning("缺少地址", "请先输入视频页面、媒体直链、m3u8 或 YouTube 地址。")
             return
         self._set_busy_analyzing(True)
         self._clear_candidates()
-        self._log("开始分析：" + url)
+        self.progress["value"] = 0
+        self._draw_segments(0)
+        self._log("开始解析媒体：" + url)
 
         thread = threading.Thread(target=self._analyze_worker, args=(url, self.referer_var.get().strip()), daemon=True)
         thread.start()
@@ -311,7 +326,7 @@ class M3U8DesktopApp(tk.Tk):
     def _start_download(self) -> None:
         candidate = self._selected_candidate()
         if not candidate:
-            messagebox.showwarning("未选择视频", "请先分析并选择一个候选视频。")
+            messagebox.showwarning("未选择媒体", "请先解析并选择一个可下载媒体。")
             return
 
         file_name = sanitize_file_name(self.file_name_var.get(), "video")
@@ -325,7 +340,7 @@ class M3U8DesktopApp(tk.Tk):
 
         self._set_downloading_state(True)
         self._draw_segments(0)
-        self.status_var.set("读取播放列表")
+        self.status_var.set("准备下载任务")
         self._log(f"准备下载：{candidate.url}")
 
         self.download_thread = threading.Thread(
@@ -423,11 +438,13 @@ class M3U8DesktopApp(tk.Tk):
         candidate = self._selected_candidate()
         if candidate:
             self.file_name_var.set(sanitize_file_name(candidate.title, "video") + _default_suffix_for_candidate(candidate))
+            self.selection_var.set(_candidate_summary(candidate))
             if candidate.referer and not self.referer_var.get().strip():
                 self.referer_var.set(candidate.referer)
 
     def _clear_candidates(self) -> None:
         self.candidates = []
+        self.selection_var.set("粘贴链接后解析可下载媒体")
         for item in self.candidate_tree.get_children():
             self.candidate_tree.delete(item)
         self.best_button.configure(state=tk.DISABLED)
@@ -435,7 +452,7 @@ class M3U8DesktopApp(tk.Tk):
 
     def _set_busy_analyzing(self, busy: bool) -> None:
         self.analyze_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
-        self.status_var.set("正在分析" if busy else "等待下载")
+        self.status_var.set("正在解析媒体" if busy else "等待下载")
 
     def _set_downloading_state(self, active: bool) -> None:
         self.start_button.configure(state=tk.DISABLED if active else tk.NORMAL)
@@ -463,26 +480,26 @@ class M3U8DesktopApp(tk.Tk):
             self._on_analysis_done(payload["candidates"])
         elif event == "analysis_error":
             self._set_busy_analyzing(False)
-            self._log("分析失败：" + payload["message"], "error")
-            messagebox.showerror("分析失败", payload["message"])
+            self._log("解析失败：" + payload["message"], "error")
+            messagebox.showerror("解析失败", payload["message"])
         elif event == "job_ready":
             self.current_job = payload["job"]
         elif event == "started":
             self._draw_segments(payload.get("total", 0))
-            self._log(f"断点缓存：{payload.get('cache_dir')}")
+            self._log(f"续传缓存：{payload.get('cache_dir')}")
         elif event == "segment":
             self._update_segment(payload["index"], payload["status"])
         elif event == "progress":
             self._update_progress(payload)
         elif event == "paused":
             self.pause_button.configure(text="继续")
-            self.status_var.set("已暂停，当前分片完成后会停住")
+            self.status_var.set("已暂停，当前网络请求完成后会停住")
         elif event == "resumed":
             self.pause_button.configure(text="暂停")
             self.status_var.set("继续下载")
         elif event == "stopping":
             self.status_var.set("正在停止")
-            self._log("停止请求已发送，已完成的分片会保留。")
+            self._log("停止请求已发送，已完成的数据会保留。")
         elif event == "stopped":
             self._set_downloading_state(False)
             self.status_var.set("已停止，可再次开始继续下载")
@@ -500,8 +517,8 @@ class M3U8DesktopApp(tk.Tk):
             messagebox.showinfo("下载完成", payload.get("output", ""))
         elif event == "failed":
             self._set_downloading_state(False)
-            self.status_var.set(f"有分片失败：失败 {payload.get('failed')}，缺失 {payload.get('missing')}")
-            self._log("任务未完成，可再次开始下载以续传失败分片。", "warning")
+            self.status_var.set(f"任务未完成：失败 {payload.get('failed')}，缺失 {payload.get('missing')}")
+            self._log("任务未完成，可再次开始下载以续传失败部分。", "warning")
         elif event == "fatal":
             self._set_downloading_state(False)
             self._log("错误：" + payload.get("message", ""), "error")
@@ -519,9 +536,10 @@ class M3U8DesktopApp(tk.Tk):
                 iid=str(index),
                 values=(
                     candidate.title,
+                    _candidate_kind_label(candidate),
                     candidate.resolution or "-",
                     f"{round(candidate.bandwidth / 1000)} kbps" if candidate.bandwidth else "-",
-                    _candidate_segments_label(candidate),
+                    _candidate_structure_label(candidate),
                     _format_duration(candidate.duration),
                     _candidate_engine_label(candidate),
                     candidate.url,
@@ -530,7 +548,7 @@ class M3U8DesktopApp(tk.Tk):
         self.best_button.configure(state=tk.NORMAL)
         self.start_button.configure(state=tk.NORMAL)
         self._select_best_candidate()
-        self._log(f"发现 {len(candidates)} 个候选视频，已选择最佳项。")
+        self._log(f"发现 {len(candidates)} 个可下载媒体，已选择推荐项。")
 
     def _update_progress(self, payload: dict) -> None:
         total = max(1, int(payload.get("total", 0)))
@@ -549,7 +567,7 @@ class M3U8DesktopApp(tk.Tk):
         self.last_progress_time = now
 
         self.status_var.set(
-            f"{done}/{total} 片，失败 {failed}，下载中 {downloading}，"
+            f"任务单元 {done}/{total}，失败 {failed}，进行中 {downloading}，"
             f"{_format_size(bytes_done)}，{_format_size(speed)}/s"
         )
 
@@ -564,7 +582,7 @@ class M3U8DesktopApp(tk.Tk):
             self.segment_canvas.create_text(
                 16,
                 18,
-                text="等待下载任务",
+                text="等待媒体任务",
                 anchor=tk.W,
                 fill="#687386",
                 font=("Microsoft YaHei UI", 10),
@@ -644,12 +662,22 @@ def _default_suffix_for_candidate(candidate: VideoCandidate) -> str:
     return ".ts"
 
 
-def _candidate_segments_label(candidate: VideoCandidate) -> str | int:
+def _candidate_kind_label(candidate: VideoCandidate) -> str:
     if candidate.source_type == "youtube":
         return "YouTube"
     if candidate.source_type == "direct":
         return "直链"
-    return candidate.segment_count or "-"
+    return "HLS"
+
+
+def _candidate_structure_label(candidate: VideoCandidate) -> str:
+    if candidate.source_type == "youtube":
+        return "自动合并"
+    if candidate.source_type == "direct":
+        return "单文件"
+    if candidate.segment_count:
+        return f"{candidate.segment_count} 片段"
+    return "播放列表"
 
 
 def _candidate_engine_label(candidate: VideoCandidate) -> str:
@@ -657,7 +685,17 @@ def _candidate_engine_label(candidate: VideoCandidate) -> str:
         return "yt-dlp"
     if candidate.source_type == "direct":
         return "HTTP"
-    return "AES" if candidate.encrypted else "-"
+    return "HLS/AES" if candidate.encrypted else "HLS"
+
+
+def _candidate_summary(candidate: VideoCandidate) -> str:
+    parts = [_candidate_kind_label(candidate), _candidate_engine_label(candidate)]
+    if candidate.resolution:
+        parts.append(candidate.resolution)
+    if candidate.duration:
+        parts.append(_format_duration(candidate.duration))
+    parts.append(_candidate_structure_label(candidate))
+    return " · ".join(parts)
 
 
 def _resource_path(relative_path: str) -> Path:
@@ -667,7 +705,7 @@ def _resource_path(relative_path: str) -> Path:
 
 if __name__ == "__main__":
     try:
-        app = M3U8DesktopApp()
+        app = UniversalVideoDownloaderApp()
         app.mainloop()
     except HlsError as exc:
         messagebox.showerror("错误", str(exc))

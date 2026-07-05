@@ -4,6 +4,8 @@
 
 > 本项目仅作为学术研究、技术学习和个人合法备份示例开源。请勿用于商业用途，请勿下载、传播或再分发没有授权的内容，请勿规避 DRM、访问控制、付费限制或版权保护机制。
 
+当前版本：`v1.0.0`。发布记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 功能
 
 - 输入网页 URL、`.m3u8` URL、普通视频直链或 YouTube 视频 URL。
@@ -39,15 +41,15 @@ python m3u8_desktop_app.py
 默认保存目录：
 
 ```text
-%USERPROFILE%\Downloads\M3U8视频
+%USERPROFILE%\Downloads\Video Downloader
 ```
 
 ## 使用流程
 
-1. 在“网页或 m3u8”输入框中粘贴视频页面 URL、`.m3u8`、`.mp4` 或 YouTube 链接。
+1. 在“视频页面、m3u8、mp4/webm 或 YouTube 链接”输入框中粘贴视频页面 URL、`.m3u8`、`.mp4` 或 YouTube 链接。
 2. 如果下载源需要防盗链来源，在 `Referer` 中填写视频页面地址；不填时会自动使用输入地址的站点来源。
-3. 点击“分析”，客户端会列出候选视频并自动选择较优清晰度。
-4. 确认保存目录和文件名，点击“开始下载”。
+3. 点击“解析媒体”，客户端会列出候选媒体并自动选择较优清晰度。
+4. 确认保存目录和文件名，点击“下载选中媒体”。
 5. 中断后再次使用同一输出路径开始下载，会复用缓存或 `.part` 文件继续下载。
 
 ## 打包为 exe
@@ -59,7 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 构建完成后可执行文件位于：
 
 ```text
-dist\M3U8Downloader\M3U8Downloader.exe
+dist\UniversalVideoDownloader\UniversalVideoDownloader.exe
 ```
 
 当前版本会把图标和 `yt-dlp` 一起打入 exe。若需要更稳定的 YouTube 音视频合并，请确保系统 PATH 中可访问 `ffmpeg`。
@@ -82,3 +84,7 @@ python -m pytest -q
 ## 合规声明
 
 本项目仅用于学术研究、协议学习、个人合法备份和软件工程练习。使用者必须自行确认下载行为符合当地法律法规、网站服务条款和版权授权范围。项目作者不鼓励、不支持、不承担任何未经授权下载、传播、商用或侵犯著作权行为产生的责任。
+
+## License
+
+本项目使用 [Academic Research and Non-Commercial Use License](LICENSE)。该许可证允许学术研究、技术学习和个人合法备份场景使用，不允许未经授权的商业用途、侵权用途或 DRM/访问控制绕过用途。

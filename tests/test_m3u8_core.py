@@ -1,4 +1,18 @@
-from m3u8_core import _looks_like_direct_video_url, _looks_like_youtube_url, find_direct_video_urls, find_m3u8_urls, parse_playlist
+from __future__ import annotations
+
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import m3u8_core
+from m3u8_core import (
+    DirectDownloadJob,
+    _looks_like_direct_video_url,
+    _looks_like_youtube_url,
+    discover_candidates,
+    find_direct_video_urls,
+    find_m3u8_urls,
+    parse_playlist,
+)
 
 
 def test_parse_master_playlist_variants() -> None:
@@ -85,3 +99,87 @@ def test_youtube_url_detection() -> None:
     assert _looks_like_youtube_url("https://www.youtube.com/watch?v=VIDEO_ID")
     assert _looks_like_youtube_url("https://youtu.be/VIDEO_ID")
     assert not _looks_like_youtube_url("https://example.com/watch?v=VIDEO_ID")
+
+
+def test_youtube_discovery_uses_ytdlp_metadata(monkeypatch) -> None:
+    class FakeYoutubeDL:
+        def __init__(self, options: dict) -> None:
+            self.options = options
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict:
+            assert url == "https://www.youtube.com/watch?v=VIDEO_ID"
+            assert download is False
+            return {
+                "id": "VIDEO_ID",
+                "title": "Example Video",
+                "width": 1920,
+                "height": 1080,
+                "duration": 95,
+                "formats": [{"height": 1080, "width": 1920, "tbr": 4200}],
+            }
+
+    fake_module = type("FakeYtDlp", (), {"YoutubeDL": FakeYoutubeDL})
+    monkeypatch.setattr(m3u8_core, "yt_dlp", fake_module)
+
+    candidates = discover_candidates("https://www.youtube.com/watch?v=VIDEO_ID")
+
+    assert len(candidates) == 1
+    assert candidates[0].source_type == "youtube"
+    assert candidates[0].resolution == "1920x1080"
+    assert candidates[0].duration == 95
+    assert "Example Video" in candidates[0].title
+
+
+def test_direct_download_job_resumes_part_file(tmp_path) -> None:
+    data = (b"0123456789abcdef" * 2048)
+    requested_ranges: list[str] = []
+
+    class RangeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path != "/video.mp4":
+                self.send_error(404)
+                return
+
+            range_header = self.headers.get("Range", "")
+            requested_ranges.append(range_header)
+            start = 0
+            if range_header:
+                start = int(range_header.removeprefix("bytes=").split("-", 1)[0])
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}")
+            else:
+                self.send_response(200)
+            payload = data[start:]
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        output_path = tmp_path / "video.mp4"
+        output_path.with_suffix(output_path.suffix + ".part").write_bytes(data[:4096])
+        job = DirectDownloadJob(
+            url=f"http://127.0.0.1:{server.server_port}/video.mp4",
+            output_path=output_path,
+            callback=lambda _event, _payload: None,
+        )
+
+        job.run()
+
+        assert output_path.read_bytes() == data
+        assert "bytes=4096-" in requested_ranges
+    finally:
+        server.shutdown()
+        server.server_close()

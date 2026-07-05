@@ -7,11 +7,11 @@ python -m PyInstaller `
   --noconfirm `
   --clean `
   --windowed `
-  --name "M3U8Downloader" `
+  --name "UniversalVideoDownloader" `
   --icon "assets\app_icon.ico" `
   --collect-all "yt_dlp" `
   --add-data "assets\app_icon.ico;assets" `
   --add-data "assets\app_icon_64.png;assets" `
   m3u8_desktop_app.py
 
-Write-Host "Build finished: dist\M3U8Downloader\M3U8Downloader.exe"
+Write-Host "Build finished: dist\UniversalVideoDownloader\UniversalVideoDownloader.exe"
