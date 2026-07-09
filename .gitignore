@@ -11,3 +11,8 @@ venv/
 *.part
 *.ytdl
 *.temp
+VEMO/
+VEMO_SKILLS/
+.vemo/*
+!.vemo/judge.jsonl
+.claude/skills/

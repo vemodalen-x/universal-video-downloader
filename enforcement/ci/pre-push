@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# VEMO push gate — safety.spec#3 (acceptance-before-push) + required judge provenance, enforced at the
+# moment that matters. Installed as .git/hooks/pre-push by enforcement/install.sh and mirrored in CI
+# (enforcement/ci/vemo-ci.yml), so `git push --no-verify` only defers the same check to the server.
+#
+# What it requires of the ACTIVE task (validators/task_state.py is the single source of logic):
+#   * risk R1+  -> state >= AcceptancePassed, evidence file exists, and — when paths.build/smoke are
+#                  configured — a machine-written verify-run receipt with exit 0 (executed ground
+#                  truth; exit codes typed into front-matter do not count).
+#   * judge-required tiers -> judge.verdict == pass in front-matter AND enough contiguous pass records
+#                  in .vemo/judge.jsonl for capability.tier × risk.
+#   * unattended (auto mode ON) R1+ -> at least one judge pass + provenance regardless of tier config.
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF/../.." && pwd)"
+# installed copy lives in .git/hooks/ — fall back to the repo root git reports
+[ -f "$ROOT/enforcement/validators/task_state.py" ] || ROOT="$(git rev-parse --show-toplevel)"
+export VEMO_ROOT="$ROOT"
+V="python3 $ROOT/enforcement/validators/task_state.py"
+
+# Collect EVERY task file changed in the pushed range (not just the active task) so a multi-task
+# push cannot smuggle an unaccepted task past the gate on the strength of one accepted sibling.
+# git feeds "<local_ref> <local_sha> <remote_ref> <remote_sha>" lines on stdin; CI (no stdin) sets
+# VEMO_DIFF_RANGE instead. No range info -> gate the active task only (same as before).
+TASK_ARGS=()
+add_range_tasks(){ # $1 = a rev range or single rev for `git diff --name-only`
+  while IFS= read -r f; do
+    case "$f" in
+      tasks/_*|tasks/Archive/*) : ;;
+      tasks/*.md) [ -f "$ROOT/$f" ] && TASK_ARGS+=(--task-file "$f") ;;
+    esac
+  done < <(git -C "$ROOT" diff --name-only $1 2>/dev/null || true)
+}
+ZERO=0000000000000000000000000000000000000000
+while read -r _lref lsha _rref rsha; do
+  [ -z "${lsha:-}" ] || [ "$lsha" = "$ZERO" ] && continue   # branch deletion: nothing to gate
+  if [ -n "${rsha:-}" ] && [ "$rsha" != "$ZERO" ]; then
+    add_range_tasks "$rsha..$lsha"
+  else
+    add_range_tasks "$lsha~1..$lsha"                        # new branch: gate at least the tip commit
+  fi
+done || true
+[ ${#TASK_ARGS[@]} -eq 0 ] && [ -n "${VEMO_DIFF_RANGE:-}" ] && add_range_tasks "$VEMO_DIFF_RANGE"
+
+fail=0
+say(){ echo "  ✗ $1" >&2; fail=1; }
+
+acc="$($V gate-check --gate acceptance-before-push ${TASK_ARGS[@]+"${TASK_ARGS[@]}"} 2>&1 || true)"
+case "$acc" in
+  ok) : ;;
+  block:no-active-task) : ;;   # nothing claims this push; plan-before-commit already gated code commits
+  block:*) say "acceptance-before-push: ${acc#block:} (safety.spec#3)" ;;
+  *) say "acceptance-before-push: validator error '$acc' (fail-closed)" ;;
+esac
+
+if [ "$($V config-get --field enforcement.require_judge_on_R2 2>/dev/null)" != "false" ]; then
+  j="$($V gate-check --gate required-judge ${TASK_ARGS[@]+"${TASK_ARGS[@]}"} 2>&1 || true)"
+  case "$j" in
+    ok|block:no-active-task) : ;;
+    block:*) say "required judge: ${j#block:} (verify.spec#3)" ;;
+    *) say "required judge: validator error '$j' (fail-closed)" ;;
+  esac
+fi
+
+tri="$($V trifecta-check 2>/dev/null || echo ok)"
+case "$tri" in
+  block:*) say "rule-of-two: ${tri#block:} (safety.spec, OWASP ASI01)" ;;
+esac
+
+if [ "$fail" -ne 0 ]; then
+  echo "[VEMO] push blocked. Fix the cause above (run \`vemo verify\` for a fresh receipt);" >&2
+  echo "       --no-verify only defers this to CI, which runs the same checks." >&2
+  exit 1
+fi
+exit 0

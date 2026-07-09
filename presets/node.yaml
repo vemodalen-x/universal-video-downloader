@@ -1,0 +1,7 @@
+# VEMO preset: Node / TypeScript. `vemo init --preset node`.
+paths:
+  build: "npm run build --if-present"
+  smoke: "npm test --silent"
+  test_entry: ["test/", "src/**/*.test.ts"]
+exclusions:
+  third_party: ["node_modules/**", "dist/**", "build/**", ".next/**", "coverage/**"]

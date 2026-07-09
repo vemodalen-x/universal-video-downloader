@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""vemo-auto — explicit enable/disable/status for VEMO full-auto (unattended) mode.
+
+Auto mode removes human-approval PAUSES only (see specs/automation.spec.md). It NEVER relaxes the
+mechanical safety guards (those hooks/CI ignore auto-mode and always fire). It is OFF by default,
+expires after a TTL, and its enablement is recorded.
+
+ENABLING REQUIRES A HUMAN AT A TERMINAL. Reducing oversight must come from outside the agent loop:
+`on` refuses without an interactive TTY and a typed confirmation, so an agent (or injected text that
+triggers one) cannot switch off its own supervision. Disabling (`off`) is always allowed — restoring
+oversight may be automated; removing it may not.
+
+Usage:
+  vemo-auto on  [--max-tier R0|R1|R2] [--ttl <hours>] [--allow-r2]   (interactive terminal only)
+  vemo-auto off
+  vemo-auto status
+"""
+import sys, os, json, argparse
+from datetime import datetime, timedelta
+
+ROOT = os.environ.get("VEMO_ROOT") or os.popen("git rev-parse --show-toplevel 2>/dev/null").read().strip() or "."
+sys.path.insert(0, os.path.join(ROOT, "enforcement", "validators"))
+try:
+    import task_state as ts
+    _CFG = ts._load_config()
+except Exception:
+    ts, _CFG = None, {}
+
+def _cfg(field, default):
+    cur = _CFG
+    for part in field.split("."):
+        cur = cur.get(part) if isinstance(cur, dict) else None
+    return default if cur is None else cur
+
+STATE = os.path.join(ROOT, ".vemo", "auto_mode.json")
+LOG = os.path.join(ROOT, str(_cfg("auto_mode.record_to", ".vemo/auto_decisions.jsonl")))
+RANK = {"R0": 1, "R1": 2, "R2": 3}
+
+
+def _who():
+    return (os.popen("git config user.name 2>/dev/null").read().strip()
+            or os.environ.get("USER") or "operator")
+
+
+def _record(event, extra):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    row = {"ts": datetime.now().isoformat(timespec="minutes"), "event": event, **extra}
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _read_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {"enabled": False}
+    exp = st.get("expires_at")
+    if st.get("enabled") and exp:
+        try:
+            if datetime.now() > datetime.fromisoformat(exp):
+                st["enabled"] = False
+                st["expired"] = True
+        except ValueError:
+            pass
+    return st
+
+
+def cmd_on(a):
+    # Human-at-terminal gate: the entity whose oversight is being reduced must not be the one
+    # reducing it. An agent's Bash tool has no TTY, so this refuses inside the agent loop.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("[vemo-auto] REFUSED: auto mode can only be enabled by a human at an interactive "
+              "terminal (no TTY detected). If you are the human: open a shell and run "
+              "`vemo auto on` yourself. This is by design — an agent must not be able to remove "
+              "its own approval pauses (specs/automation.spec.md#1).")
+        return 2
+    if a.max_tier == "R2" and not a.allow_r2:
+        print("[vemo-auto] REFUSED: --max-tier R2 requires the explicit --allow-r2 confirmation "
+              "(R2 = core/auth/migrations/infra). Re-run with --allow-r2 if you really mean it.")
+        return 2
+    ttl = a.ttl if a.ttl is not None else float(_cfg("auto_mode.default_ttl_hours", 8))
+    print(f"[vemo-auto] You are about to remove human-approval pauses up to {a.max_tier} "
+          f"for {ttl or '∞'}h. Mechanical guards + the judge still apply.")
+    try:
+        answer = input("Type 'yes' to confirm: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer != "yes":
+        print("[vemo-auto] not confirmed — auto mode stays OFF.")
+        return 2
+    now = datetime.now()
+    st = {
+        "enabled": True,
+        "max_auto_tier": a.max_tier,
+        "allow_r2": bool(a.allow_r2),
+        "enabled_by": _who(),
+        "enabled_at": now.isoformat(timespec="minutes"),
+        "expires_at": (now + timedelta(hours=ttl)).isoformat(timespec="minutes") if ttl > 0 else "",
+        "preauthorized_commands": list(_cfg("auto_mode.preauthorized_commands", []) or []),
+    }
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(st, open(STATE, "w", encoding="utf-8"), indent=2)
+    _record("auto_mode_enabled", {k: st[k] for k in ("max_auto_tier", "allow_r2", "enabled_by", "expires_at")})
+    print(f"[vemo-auto] AUTO MODE ON — max_auto_tier={a.max_tier} allow_r2={bool(a.allow_r2)} "
+          f"expires={st['expires_at'] or 'never'} by={st['enabled_by']}")
+    print("  Reminder: mechanical safety guards (scope/destructive/secret) + the judge STILL apply.")
+    # reset the run-budget counter so this unattended run is bounded from zero
+    json.dump({"started": now.isoformat(timespec="minutes"), "tool_calls": 0, "files": []},
+              open(os.path.join(ROOT, ".vemo", "run.json"), "w", encoding="utf-8"), indent=2)
+    print("  Run-budget counter reset. Ensure run_budget.enabled:true — an unattended run needs a stop rule.")
+    return 0
+
+
+def cmd_off(_a):
+    st = _read_state()
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump({"enabled": False, "disabled_at": datetime.now().isoformat(timespec="minutes")},
+              open(STATE, "w", encoding="utf-8"), indent=2)
+    _record("auto_mode_disabled", {"was_enabled": st.get("enabled", False)})
+    print("[vemo-auto] AUTO MODE OFF — back to human-in-the-loop gates.")
+    return 0
+
+
+def cmd_status(_a):
+    st = _read_state()
+    if not st.get("enabled"):
+        print("[vemo-auto] status: OFF" + (" (expired)" if st.get("expired") else ""))
+    else:
+        print(f"[vemo-auto] status: ON — max_auto_tier={st.get('max_auto_tier')} "
+              f"allow_r2={st.get('allow_r2')} expires={st.get('expires_at') or 'never'} by={st.get('enabled_by')}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="vemo-auto")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    on = sub.add_parser("on")
+    on.add_argument("--max-tier", dest="max_tier",
+                    default=str(_cfg("auto_mode.default_max_auto_tier", "R1")), choices=["R0", "R1", "R2"])
+    on.add_argument("--ttl", type=float, default=None, help="hours until auto-expiry (0 = never)")
+    on.add_argument("--allow-r2", dest="allow_r2", action="store_true")
+    sub.add_parser("off"); sub.add_parser("status")
+    a = ap.parse_args()
+    sys.exit({"on": cmd_on, "off": cmd_off, "status": cmd_status}[a.cmd](a))
+
+
+if __name__ == "__main__":
+    main()

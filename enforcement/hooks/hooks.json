@@ -1,0 +1,35 @@
+{
+  "_comment": "VEMO enforcement hooks for Claude Code. Registered into .claude/settings.json by enforcement/install.sh (idempotent — re-running dedupes). One pure-Python dispatcher (run.py) handles every guard: single source of truth, Windows-friendly, honors enforcement.mode/block_on/fail_closed + observability.telemetry. $CLAUDE_PROJECT_DIR makes the commands CWD-independent (a session started in a subdirectory still finds the dispatcher); the '.' fallback covers harnesses that do not set it. Exit 2 = block the action and feed stderr back to the agent.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/enforcement/hooks/run.py\" session-start", "timeout": 5 } ] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/enforcement/hooks/run.py\" edit", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/enforcement/hooks/run.py\" command", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "*",
+        "_comment": "run-budget stop rule — counts every tool call; hard-stops a runaway only when auto mode is ON",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/enforcement/hooks/run.py\" budget", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/enforcement/hooks/run.py\" stop", "timeout": 8 } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/enforcement/hooks/run.py\" subagent-stop", "timeout": 8 } ] }
+    ]
+  }
+}

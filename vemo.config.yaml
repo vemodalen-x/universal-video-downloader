@@ -1,0 +1,180 @@
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ VEMO config. Grouped by how often you touch it (progressive disclosure):     │
+# │   ESSENTIAL  (set these; `vemo init --preset` fills most):                   │
+# │              capability.tier · paths.build/smoke · risk_tiers.*.match_paths  │
+# │   COMMON     (sometimes): auto_mode · run_budget · model_routing (advisory)  │
+# │   ADVANCED   (defaults are fine): enforcement · concurrency · observability  │
+# │ `vemo init --preset <stack>` adds vemo.config.preset.yaml, deep-merged over  │
+# │ this file (stack defaults stay separable from the template).                 │
+# │ CONTRACT: every key here has a consumer — `selfcheck` fails on a knob that   │
+# │ changes nothing (a false control surface is worse than no knob).             │
+# └───────────────────────────────────────────────────────────────────────────┘
+
+vemo:
+  version: "1.9.0"
+  upstream: ""            # optional: a VEMO upstream repo for sync/contribute/release
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPABILITY TIER — the knob that scales the framework to model strength.
+# ─────────────────────────────────────────────────────────────────────────────
+capability:
+  tier: high             # frontier | high | medium | low
+  # VENDOR-NEUTRAL: the tier is a BEHAVIORAL contract, not a brand list — classify ANY vendor's model
+  # by the observed-behavior rubric in specs/capability.spec.md §1.5 (Anthropic names below are examples
+  # only). A repo shared by several models pins the tier to the WEAKEST model allowed to work in it.
+  # CAPABILITY-MONOTONIC RULE (specs/capability.spec.md): as tier ↑, PRESCRIPTION shrinks but
+  # VERIFICATION + BOUNDARIES + AUDIT hold/tighten — never the reverse. Stronger model = less
+  # hand-holding AND more independent, executed-ground-truth verification (the verifier problem).
+  # frontier → Mythos-class (e.g. Fable 5): trust long-horizon self-planning + self-tests; minimal
+  #            prescription; BUT pair with run_budget stop rules and keep the independent judge.
+  # high   → terse handshakes, model self-plans/self-verifies, JIT reads, judge on R2 only
+  # medium → explicit handshakes, judge on R1+R2
+  # low    → full handshakes, fuller reads, judge on R1+R2, smaller autonomous steps
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL ROUTING — ADVISORY. Read by humans and by the agent's prose layer when it spawns
+# subagents; NO mechanism routes models (your harness does). The judge's model is pinned in
+# agents/governance-judge.md front-matter — keep the two in sync by hand (docs-sync flags drift).
+# The names below are ONE vendor's examples — substitute your provider's equivalents (gpt-*,
+# gemini-*, deepseek-*, qwen-*…): the contract is the ROLE SPLIT (worker ≠ judge), not the brand.
+# When your harness offers several model families, prefer a judge from a DIFFERENT family than the
+# worker: fresh context removes shared session state; a different family removes shared blind spots.
+# ─────────────────────────────────────────────────────────────────────────────
+model_routing:
+  long_horizon: fable-5  # multi-day / large-migration / R2 explore-and-build (Mythos-class). 2x cost — reserve it.
+  plan:        opus      # planning / architecture / decomposition
+  implement:   sonnet    # mechanical edits, refactors
+  judge:       opus      # independent verification — keep separate from the frontier worker
+  mechanical:  haiku     # grep / build index / scan logs (cheap subagents)
+  default:     sonnet
+  # Cost rule (from Fable 5 analysis): route frontier ONLY to long-horizon/R2 where autonomy IS the
+  # product. Never send R0/R1 to a Mythos-class model ("renting a truck to deliver a letter").
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VERIFICATION — scales UP with capability (the verifier problem).
+# ─────────────────────────────────────────────────────────────────────────────
+verification:
+  ground_truth_required: true   # a 'passed' acceptance needs a REAL run: the evidence file must exist,
+                                # and when paths.build/smoke are set the gate trusts ONLY the machine
+                                # receipt written by `vemo verify` — never exit codes typed into front-matter
+  require_intent_narration: true # the agent must narrate intent; missing narration is a red flag (CoT monitoring)
+  independent_verifiers:        # judge attempts per R2 gate by capability tier; enforced by required-judge
+                                # via contiguous pass records in .vemo/judge.jsonl (combats same-class blind
+    frontier: 3                 # spots). >1 = the judge agent is invoked that many times with fresh
+    high: 2                     # context; each records via judge-record. (True parallel panels: ROADMAP.)
+    medium: 1
+    low: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RISK TIERS — ceremony scales with blast radius. Default to the lowest that fits.
+# ─────────────────────────────────────────────────────────────────────────────
+risk_tiers:
+  unmatched: R1          # fail-safe default: a path matching NO tier is standard work, not trivial
+  R0_trivial:
+    match_paths:  ["**/*.md", "docs/**", "*.txt"]
+    gates:        [plan_inline]          # gates/judge here are read by the specs (prose ceremony),
+    judge:        false                  # match_paths by tier-required (mechanical)
+  R1_standard:
+    match_paths:  ["src/**", "lib/**", "app/**", "**/*.json"]
+    gates:        [plan, acceptance]
+    judge:        "tier<=medium OR path:critical"
+  R2_critical:
+    match_paths:              # block list (one glob per line — the stdlib parser's native form)
+      - "src/core/**"
+      - "**/migrations/**"
+      - "**/auth/**"
+      - "infra/**"
+      # the governance layer protects itself — changing the rules IS the highest blast radius:
+      - "enforcement/**"
+      - ".claude/**"
+      - ".github/**"
+      - "vemo.config*.yaml"
+      - "specs/**"
+      # audit-visibility files: one ignore line can hide judge provenance / receipts from git+CI
+      - ".gitignore"
+      - ".gitattributes"
+    gates:        [plan, human_review, acceptance, procedure]
+    judge:        true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENFORCEMENT — gates are mechanism, not prose. Defense in depth.
+# Consumers: hooks/run.py (mode, block_on, fail_closed, degrade_gracefully),
+#            ci/pre-commit (enforce_risk_tier, require_judge_on_R2), validator (rule_of_two).
+# ─────────────────────────────────────────────────────────────────────────────
+enforcement:
+  mode:         enforce  # enforce | monitor  (monitor = observe-only: log, don't block — for onboarding)
+  hooks:        true     # client-side: fast feedback inside the agent loop (`vemo status` reports these)
+  ci_backstop:  true     # server-side: authoritative — enforcement/ci/vemo-ci.yml + branch protection
+  block_on:              # active guards; remove an entry to disable that guard (logged as skipped)
+    - scope_violation        # editing files outside the active task's Scope (In)
+    - missing_task_plan      # commit without a task file plan
+    - unverified_push        # push before acceptance passes (pre-push + CI)
+    - destructive_command    # rm -rf / git reset --hard / force-push / out-of-repo writes
+    - secret_in_diff         # credentials/keys in a staged change
+    - binary_blob            # hand-editing build artifacts / model weights (safety.spec#6)
+  safety_invariant_of_capability: true  # asserted by selfcheck: scope/destructive/secret/budget NEVER relax with tier
+  degrade_gracefully: false  # safety-critical guards FAIL CLOSED if the validator errors (a missing
+  fail_closed:               # guard is not a safe guard); set true to opt into fail-open + loud logging
+    - scope_violation
+    - destructive_command
+    - secret_in_diff
+  enforce_risk_tier: true    # pre-commit/CI compute required tier from changed paths; block self-downgrade
+  require_judge_on_R2: true  # enables the required-judge gate: low/medium R1 needs one pass; R2 depth scales by capability.tier
+  rule_of_two: true          # OWASP ASI01 / Meta "Rule of Two": a task declaring all 3 lethal-trifecta
+                             # properties {private_data, untrusted_content, external_comms} needs explicit
+                             # human approval; unattended auto mode must STOP (validator trifecta-check).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS / RUNTIME
+# ─────────────────────────────────────────────────────────────────────────────
+paths:
+  tasks:        "tasks"
+  task_archive: "tasks/Archive"
+  specs:        "specs"
+  repo_root:    "."
+  test_entry:   []         # e.g. ["tests/smoke.sh"] — documentation for humans/agents
+  # dogfood: VEMO's own build = its conformance eval, its smoke = selfcheck. So VEMO's own pushes
+  # require a machine receipt — the framework eats its executed-ground-truth rule.
+  build:        "python3 eval/run.py"                              # `vemo verify` EXECUTES this and writes the receipt
+  smoke:        "python3 enforcement/validators/task_state.py selfcheck"
+
+concurrency:
+  stale_threshold_hours: 4   # doctor flags live tasks with a heartbeat older than this (takeover candidates)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN BUDGET / STOP RULES — Mythos-class models "run until the harness cuts them off".
+# Hard-stop when unattended (auto on); advisory when a human is present.
+# Also detects STUCK LOOPS: the same Bash command 3× in a row = no progress (an agent that
+# repeats itself has stopped thinking — 2026 Codex/harness practice) -> same stop/advisory path.
+# ─────────────────────────────────────────────────────────────────────────────
+run_budget:
+  enabled: true
+  max_tool_calls: 300
+  max_files_touched: 100       # WRITE-touched files (reading is not touching)
+  max_wall_clock_min: 240      # cap unattended runs at HOURS not days (Fable 5/Mythos analysis)
+  checkpoint_every_calls: 25   # advisory note: record progress to the task file
+  reanchor_every_calls: 50     # advisory note: re-state the original task intent (long runs drift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO MODE — full-auto / unattended. Removes human-APPROVAL pauses (auto-decide + record);
+# NEVER relaxes the mechanical guards or the judge. OFF by default. Enabling requires a HUMAN
+# at an interactive terminal (`vemo auto on` refuses without a TTY + typed confirmation) —
+# an agent must not be able to remove its own approval pauses. See specs/automation.spec.md.
+# ─────────────────────────────────────────────────────────────────────────────
+auto_mode:
+  default_max_auto_tier: R1     # auto-approve up to here; R2 needs explicit --allow-r2
+  default_ttl_hours: 8          # auto-expire; 0 = never (discouraged)
+  require_judge: true           # unattended R1+ push additionally requires judge pass + provenance
+                                # (gate-check enforces; the judge replaces the absent human reviewer)
+  keep_mechanical_guards: true  # asserted by selfcheck: guards ALWAYS fire, even in auto mode
+  preauthorized_commands: []    # destructive cmds allowed unattended (default none — explicit opt-in;
+                                # copied into auto state at `vemo auto on`, honored by the command guard)
+  record_to: ".vemo/auto_decisions.jsonl"
+
+observability:
+  telemetry: gate_events     # off | gate_events | full — blocks/stops are ALWAYS logged (audit first);
+                             # `full` also logs allows; `off` suppresses only the non-block noise
+  eval_on_release: true      # governance-release skill runs eval/ conformance before cutting a release
+
+exclusions:
+  third_party: ["3rdparty/**", "vendor/**", "node_modules/**"]   # exempt from the binary-blob guard

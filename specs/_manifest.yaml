@@ -1,0 +1,31 @@
+# Progressive disclosure map: load ONLY the specs a task needs, when it needs them.
+# This keeps context loading just-in-time. "Context is a budget." [Anthropic]
+#
+# The agent reads this manifest (cheap), then loads the listed specs for the active
+# task type + risk tier. Nothing else is pre-read.
+
+always_on:
+  # The only spec loaded at every session start. Keep it tiny.
+  - safety.spec.md
+
+by_task_type:
+  doc_change:      [task.spec.md]                              # R0 fast path
+  config_change:   [task.spec.md, safety.spec.md]
+  code_change:     [task.spec.md, coding.spec.md, comment.spec.md, verify.spec.md, capability.spec.md]
+  refactor:        [task.spec.md, coding.spec.md, verify.spec.md]
+  debug:           [task.spec.md, verify.spec.md]
+  release:         [task.spec.md, verify.spec.md]
+  governance_edit: [task.spec.md, safety.spec.md]              # editing VEMO itself
+
+# Loaded regardless of task type when the risk tier applies:
+risk_overrides:
+  R2_critical:     [verify.spec.md, concurrency.spec.md, capability.spec.md]  # critical work: judge + concurrency + capability-monotonic verification
+
+# Loaded only on explicit trigger (never auto):
+on_demand:
+  multi_session_conflict: [concurrency.spec.md]
+  effect_quality:         [domain/effect_quality.overlay.md]   # optional domain overlay
+  auto_mode_enabled:      [automation.spec.md]                 # load when `task_state.py auto-status` is ON
+
+# Capability note: at capability.tier=high the agent may load a spec's HEADERS first
+# and pull full sections on demand; at tier=low it loads listed specs in full.

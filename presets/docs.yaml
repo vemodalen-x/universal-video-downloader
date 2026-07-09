@@ -1,0 +1,8 @@
+# VEMO preset: docs-only / content repo. `vemo init --preset docs`.
+# Most changes are R0 (fast path); no build/smoke. Velocity-first by default.
+paths:
+  build: ""
+  smoke: ""
+  test_entry: []
+exclusions:
+  third_party: ["node_modules/**", "_site/**", ".jekyll-cache/**"]

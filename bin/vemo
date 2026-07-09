@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""vemo — one command for the whole framework.
+
+Usability layer: wraps the enforcement scripts behind friendly verb subcommands so users type
+`vemo status` instead of `python3 enforcement/validators/task_state.py auto-status`. Convention over
+configuration + progressive disclosure: `vemo` alone prints the map; `vemo explain <topic>` teaches a
+concept in one plain sentence. Pure stdlib; resolves its own repo root, so it works wherever VEMO is dropped.
+"""
+import sys, os, subprocess, shutil
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # bin/ -> repo root
+os.environ.setdefault("VEMO_ROOT", ROOT)
+PY = sys.executable or "python3"
+TS = [PY, os.path.join(ROOT, "enforcement", "validators", "task_state.py")]
+
+
+def _ts(*args):
+    return subprocess.run(TS + list(args), capture_output=True, text=True).stdout.strip()
+
+
+EXPLAIN = {
+    "tiers": "Risk tiers scale ceremony to blast radius. R0 trivial (docs) = fast path; R1 standard code; "
+             "R2 critical (core/auth/migrations) = review + judge. Default to the LOWEST tier that fits.",
+    "gates": "ENFORCED (mechanical, non-negotiable): scope, no destructive cmd, no secrets, "
+             "acceptance-before-push, risk-tier integrity, required judge depth. ADVISED (your judgment): style, "
+             "comments, decomposition depth.",
+    "auto": "Full-auto mode removes human-APPROVAL pauses (records each decision instead). OFF by default; "
+            "`vemo auto on`. Never relaxes the mechanical guards or the judge. Bounded by a risk ceiling + TTL.",
+    "budget": "Run budget = stop rules for long-horizon / Mythos-class models that 'run until cut off'. "
+              "Hard-stops a runaway when UNATTENDED (auto on); advisory when a human is present.",
+    "judge": "An independent subagent (separate context, told to refute 'done') flips required gates instead "
+             "of the worker self-reporting. Low/medium R1 need one pass; R2 depth scales by capability.tier.",
+    "capability": "capability.tier (frontier|high|medium|low) scales ceremony to MODEL strength. Stronger "
+                  "model -> less prescription, more self-verify. Raise it when you upgrade the model.",
+    "presets": "`vemo init --preset python|node|cpp|docs` writes a stack overlay (vemo.config.preset.yaml) so "
+               "VEMO is preconfigured for your repo type. Convention over configuration.",
+    "verify": "`vemo verify` EXECUTES paths.build/paths.smoke and writes an evidence log + a machine "
+              "receipt (.vemo/run/receipt.json). The push gate trusts the receipt — not exit codes "
+              "typed into front-matter. Executed ground truth, produced by the gate's own side.",
+}
+
+
+def cmd_status():
+    g = lambda f: _ts("config-get", "--field", f)
+    print("VEMO status")
+    print(f"  version         : {g('vemo.version')}")
+    print(f"  capability tier : {g('capability.tier')}   (raise when you upgrade the model)")
+    print(f"  enforcement     : mode={g('enforcement.mode')}  hooks={g('enforcement.hooks')}  ci_backstop={g('enforcement.ci_backstop')}")
+    print(f"  run budget      : {_ts('budget-status')}")
+    print(f"  auto mode       : {_ts('auto-status')}")
+    print(f"  active task     : {_ts('active')}")
+    print("  tip: `vemo explain <tiers|gates|auto|budget|judge|capability|presets|verify>`")
+    return 0
+
+
+def cmd_doctor():
+    print(_ts("doctor"))
+    hooks = os.path.exists(os.path.join(ROOT, ".claude", "settings.json"))
+    print("  hooks installed :", "yes" if hooks else "no  (run: vemo init)")
+    for tool in ("git", "python"):
+        print(f"  {tool:15}:", "found" if shutil.which(tool) else "MISSING")
+    return 0
+
+
+def _presets():
+    d = os.path.join(ROOT, "presets")
+    return sorted(p[:-5] for p in os.listdir(d) if p.endswith(".yaml")) if os.path.isdir(d) else []
+
+
+def cmd_init(args):
+    preset = args[args.index("--preset") + 1] if "--preset" in args else None
+    dry = "--dry-run" in args
+    if "--minimal" in args:                       # R1: no-install monitor trial (zero friction)
+        import re
+        cfgp = os.path.join(ROOT, "vemo.config.yaml")
+        if os.path.exists(cfgp):
+            _t = open(cfgp).read()                               # read BEFORE opening for write (truncates)
+            open(cfgp, "w").write(re.sub(r"(?m)^(\s*mode:\s*)\w+", r"\1monitor", _t, count=1))
+        os.makedirs(os.path.join(ROOT, "tasks", "Archive"), exist_ok=True)
+        print("[vemo] MINIMAL (monitor mode): enforcement OBSERVES + logs, blocks nothing — no hooks/git installed.")
+        print("       Kick the tires, then turn on real enforcement:  vemo init --preset <python|node|cpp|docs>")
+        return 0
+    if preset and preset not in _presets():
+        print(f"[vemo] unknown preset '{preset}'. Available: {', '.join(_presets()) or '(none)'}")
+        return 2
+    plan = ([f"apply preset '{preset}' -> vemo.config.preset.yaml"] if preset else []) + \
+           ["ensure tasks/ and tasks/Archive/", "install hooks + git pre-commit (enforcement/install.sh)"]
+    if dry:
+        print("[vemo init] DRY RUN — would:"); [print("  -", s) for s in plan]; return 0
+    if preset:
+        shutil.copyfile(os.path.join(ROOT, "presets", preset + ".yaml"),
+                        os.path.join(ROOT, "vemo.config.preset.yaml"))
+        print(f"  ✓ preset '{preset}' applied (vemo.config.preset.yaml)")
+    os.makedirs(os.path.join(ROOT, "tasks", "Archive"), exist_ok=True)
+    inst = os.path.join(ROOT, "enforcement", "install.sh")
+    if os.path.exists(inst):
+        subprocess.run(["bash", inst])
+    print("[vemo] ready. AHA: copy tasks/_TASK_TEMPLATE.md to a task file, set its Scope (In), and code — "
+          "out-of-scope edits are now blocked automatically. `vemo status` shows state.")
+    return 0
+
+
+HELP = """vemo <command>
+  init [--preset python|node|cpp|docs] [--minimal] [--dry-run]   set up VEMO (--minimal = no-install monitor trial)
+  status                          plain-language dashboard (mode / tier / budget / task)
+  context                         machine-read session brief (<=20 lines: task/gates/budget/rules) — read this, not the raw config
+  verify                          EXECUTE paths.build/smoke -> evidence log + machine receipt (the push gate reads this)
+  doctor                          health check (config + hooks + tools + gates-heartbeat)
+  selfcheck                       internal consistency (ENFORCED-BY claims + config keys must have consumers)
+  eval                            executable conformance harness (validator + hook end-to-end)
+  judge-brief [--lens <l>]        evidence dossier for a judge pass (claims / gates / receipt / changes + lens checklist)
+  heartbeat                       stamp the active task's heartbeat in place (no hand-editing the task file)
+  explain <topic>                 tiers | gates | auto | budget | judge | capability | presets | verify
+  auto on|off|status              full-auto (unattended) mode (`on` = human at a terminal only)
+  budget status|reset             run budget / stop rules
+  tier <paths...>                 required risk tier for the given paths
+  check <path>                    is a path inside the active task's scope?
+  skill-score                     quality bar for VEMO's own skills (frontmatter/name/catalog parity/backing scripts)
+  skill-audit                     catalog<->disk consistency audit of the skill registry
+  skill-roster                    list VEMO's own skills (name + purpose) — what the agent can invoke"""
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("help", "-h", "--help"):
+        print(HELP); return 0
+    c = a[0]
+    if c == "status": return cmd_status()
+    if c == "doctor": return cmd_doctor()
+    if c == "verify":  # stream output live — this actually runs the build/smoke
+        return subprocess.run(TS + ["verify-run"]).returncode
+    if c == "selfcheck":  # propagate the real exit code — a red selfcheck must fail the caller
+        return subprocess.run(TS + ["selfcheck"]).returncode
+    if c == "eval": return subprocess.run([PY, os.path.join(ROOT, "eval", "run.py")] + a[1:]).returncode
+    if c in ("context", "judge-brief", "heartbeat"):
+        return subprocess.run(TS + a).returncode
+    if c == "init": return cmd_init(a[1:])
+    if c == "explain":
+        print(EXPLAIN.get(a[1], "topics: " + ", ".join(EXPLAIN)) if len(a) > 1 else "topics: " + ", ".join(EXPLAIN))
+        return 0
+    if c == "auto":
+        return subprocess.run([PY, os.path.join(ROOT, "enforcement", "automation", "vemo-auto")] + a[1:]).returncode
+    if c == "budget":
+        print(_ts("budget-" + (a[1] if len(a) > 1 else "status"))); return 0
+    if c == "tier":
+        print(_ts("tier-required", "--paths", *(a[1:] or ["."]))); return 0
+    if c == "check":
+        print(_ts("scope-check", "--path", a[1] if len(a) > 1 else ".")); return 0
+    if c in ("skill-score", "skill-audit", "skill-roster"):
+        sk = os.path.join(ROOT, "enforcement", "validators", "skill_check.py")
+        return subprocess.run([PY, sk, c.split("-", 1)[1]]).returncode
+    print("unknown command:", c, "\n" + HELP); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

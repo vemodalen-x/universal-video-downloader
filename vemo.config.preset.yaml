@@ -1,0 +1,9 @@
+# VEMO preset: Python. Applied by `vemo init --preset python` (copied to vemo.config.preset.yaml,
+# which deep-merges over vemo.config.yaml). Only the stack-specific keys live here — everything else
+# inherits the template defaults. Convention over configuration.
+paths:
+  build: "python -m compileall -q m3u8_core.py m3u8_desktop_app.py photo_archive_core.py photo_archive_cli.py photo_archive_app.py tests"
+  smoke: "python -m pytest tests -q"
+  test_entry: ["tests/"]
+exclusions:
+  third_party: [".venv/**", "**/__pycache__/**", "build/**", "dist/**", "*.egg-info/**"]

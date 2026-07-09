@@ -1,0 +1,2 @@
+{"ts": "2026-07-09T21:44", "task": "T-20260709-vemo-framework-integration", "verdict": "pass", "session": "unknown", "evidence": "framework diff reviewed; selfcheck/tests/verify passed", "confidence": "high"}
+{"ts": "2026-07-09T21:47", "task": "T-20260709-vemo-framework-integration", "verdict": "pass", "session": "unknown", "evidence": "second governance pass: staged scope excludes photo archive changes; R2 task, verify receipt, and judge log present", "confidence": "high"}

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# VEMO commit backstop — safety.spec rules 1,2,5 + risk-tier integrity + required judge provenance.
+# Installed as .git/hooks/pre-commit AND re-run server-side by enforcement/ci/vemo-ci.yml, so
+# `git commit --no-verify` cannot ship to a protected main. Does NOT depend on the agent: even a
+# human or a hookless agent hits it.
+#
+# Modes:
+#   * local pre-commit (default): checks the STAGED diff (git diff --cached)
+#   * CI range mode: set VEMO_DIFF_RANGE (e.g. "origin/main...HEAD") to check a pushed/PR range
+# Config switches it honors: enforcement.enforce_risk_tier, enforcement.require_judge_on_R2.
+# Failure semantics: a validator error is treated as a FAILURE of that check (fail closed), never
+# as a silent pass.
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SELF/../.." && pwd)"
+[ -f "$ROOT/enforcement/validators/task_state.py" ] || ROOT="$(git rev-parse --show-toplevel)"
+export VEMO_ROOT="$ROOT"
+V="python3 $ROOT/enforcement/validators/task_state.py"
+
+if [ -n "${VEMO_DIFF_RANGE:-}" ]; then
+  staged="$(git diff --name-only "$VEMO_DIFF_RANGE")"
+  diffcmd=(git diff -U0 "$VEMO_DIFF_RANGE")
+else
+  staged="$(git diff --cached --name-only)"
+  diffcmd=(git diff --cached -U0)
+fi
+[ -z "$staged" ] && exit 0
+mapfile -t staged_paths <<< "$staged"
+
+# A CI push/PR range may contain multiple task files. Validate against the
+# changed task set, not only whichever live task has the newest heartbeat.
+task_ctx=()
+for f in "${staged_paths[@]}"; do
+  case "$f" in
+    tasks/_*.md|tasks/Archive/*) ;;
+    tasks/*.md) task_ctx+=(--task-file "$ROOT/$f") ;;
+  esac
+done
+
+fail=0; note(){ echo "  ✗ $1"; fail=1; }
+rank(){ case "$1" in R2*) echo 3;; R1*) echo 2;; *) echo 1;; esac; }
+cget(){ $V config-get --field "$1" 2>/dev/null || echo null; }
+
+# Rule 2: plan-before-commit for any staged source file
+if echo "$staged" | grep -qE '\.(c|cc|cpp|h|hpp|py|ts|js|go|rs|java)$'; then
+  v="$($V gate-check --gate plan-before-commit "${task_ctx[@]}" 2>&1 || true)"
+  [ "$v" = "ok" ] || note "plan-before-commit: ${v:-validator error (fail-closed)} — no active task plan for staged code (safety.spec#2)"
+fi
+
+# Rule 1: scope containment — every staged file inside the active task's scope_in
+for f in "${staged_paths[@]}"; do
+  [ -z "$f" ] && continue
+  case "$($V scope-check --path "$ROOT/$f" "${task_ctx[@]}" 2>/dev/null || echo error)" in
+    in-scope) : ;;
+    out-of-scope)   note "scope: '$f' is outside the active task scope_in (safety.spec#1)";;
+    no-active-task) note "scope: no active task declares scope_in (safety.spec#1)";;
+    *)              note "scope: validator error on '$f' (fail-closed, safety.spec#1)";;
+  esac
+done
+
+# Risk-tier integrity: REQUIRED tier (from changed paths; unmatched=R1, governance layer=R2)
+# must not exceed the DECLARED tier — the agent cannot self-downgrade a critical change.
+if [ "$(cget enforcement.enforce_risk_tier)" != "false" ]; then
+  required="$($V tier-required --paths "${staged_paths[@]}" 2>/dev/null || echo R2)"   # error -> strictest (fail closed)
+  declared="$($V task-risk "${task_ctx[@]}" 2>/dev/null || echo R0)"; declared="${declared:-R0}"
+  if [ "$(rank "$declared")" -lt "$(rank "$required")" ]; then
+    note "risk-tier downgrade: staged files require $required but the task declares $declared — no self-downgrade (safety.spec#tier)"
+  fi
+else
+  required="R0"; declared="$($V task-risk "${task_ctx[@]}" 2>/dev/null || echo R0)"
+fi
+
+# Judge-required tiers must be independently judged — and the verdict must have enough provenance records.
+if [ "$(cget enforcement.require_judge_on_R2)" != "false" ]; then
+  if [ "$(rank "${required:-R0}")" -eq 3 ] || [ "$(rank "${declared:-R0}")" -eq 3 ]; then
+    j="$($V gate-check --gate required-judge "${task_ctx[@]}" 2>&1 || true)"
+    [ "$j" = "ok" ] || note "required judge: ${j#block:} — see agents/governance-judge.md"
+  fi
+fi
+
+# Rule 5: no secrets. Avoid `git diff | grep -q` under pipefail: grep may exit early after a hit,
+# SIGPIPE the producer, and turn a real match into a non-zero pipeline status.
+diff_tmp="${TMPDIR:-/tmp}/vemo-diff-$$.patch"
+if "${diffcmd[@]}" >"$diff_tmp"; then
+  if grep -iqE '(api[_-]?key|secret|password|token)["'"'"' ]*[:=]["'"'"' ]*[A-Za-z0-9/_+-]{16,}|BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY' "$diff_tmp"; then
+    note "secret-scan: possible credential in the diff (safety.spec#5)"
+  fi
+else
+  note "secret-scan: git diff failed (fail-closed, safety.spec#5)"
+fi
+rm -f "$diff_tmp"
+
+if [ "$fail" -ne 0 ]; then
+  echo "[VEMO] commit blocked by enforcement backstop. Fix the cause above; do not --no-verify around it (CI re-checks)." >&2
+  exit 1
+fi
+exit 0

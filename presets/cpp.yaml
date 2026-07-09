@@ -1,0 +1,7 @@
+# VEMO preset: C/C++ (CMake). `vemo init --preset cpp`.
+paths:
+  build: "cmake --build build"
+  smoke: "ctest --test-dir build --output-on-failure"
+  test_entry: ["tests/"]
+exclusions:
+  third_party: ["3rdparty/**", "vendor/**", "build/**", "external/**"]

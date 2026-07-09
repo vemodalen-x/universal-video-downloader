@@ -1,0 +1,70 @@
+﻿{
+    "hooks":  {
+                  "SessionStart":  [
+                                       {
+                                           "hooks":  [
+                                                         {
+                                                             "type":  "command",
+                                                             "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" session-start",
+                                                             "timeout":  5
+                                                         }
+                                                     ]
+                                       }
+                                   ],
+                  "PreToolUse":  [
+                                     {
+                                         "matcher":  "Edit|Write|MultiEdit|NotebookEdit",
+                                         "hooks":  [
+                                                       {
+                                                           "type":  "command",
+                                                           "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" edit",
+                                                           "timeout":  5
+                                                       }
+                                                   ]
+                                     },
+                                     {
+                                         "matcher":  "Bash",
+                                         "hooks":  [
+                                                       {
+                                                           "type":  "command",
+                                                           "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" command",
+                                                           "timeout":  5
+                                                       }
+                                                   ]
+                                     },
+                                     {
+                                         "matcher":  "*",
+                                         "_comment":  "run-budget stop rule — counts every tool call; hard-stops a runaway only when auto mode is ON",
+                                         "hooks":  [
+                                                       {
+                                                           "type":  "command",
+                                                           "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" budget",
+                                                           "timeout":  5
+                                                       }
+                                                   ]
+                                     }
+                                 ],
+                  "Stop":  [
+                               {
+                                   "hooks":  [
+                                                 {
+                                                     "type":  "command",
+                                                     "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" stop",
+                                                     "timeout":  8
+                                                 }
+                                             ]
+                               }
+                           ],
+                  "SubagentStop":  [
+                                       {
+                                           "hooks":  [
+                                                         {
+                                                             "type":  "command",
+                                                             "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" subagent-stop",
+                                                             "timeout":  8
+                                                         }
+                                                     ]
+                                       }
+                                   ]
+              }
+}
