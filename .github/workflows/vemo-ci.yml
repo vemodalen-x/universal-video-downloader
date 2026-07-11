@@ -18,6 +18,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
       - name: Framework self-consistency (selfcheck — incl. ENFORCED-BY claims map to real mechanisms)
         run: python3 enforcement/validators/task_state.py selfcheck
 
