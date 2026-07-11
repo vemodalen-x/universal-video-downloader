@@ -1,6 +1,6 @@
 from pathlib import Path
-
-from PIL import Image
+import struct
+import zlib
 
 from m3u8_core import VideoCandidate
 from m3u8_desktop_app import (
@@ -48,20 +48,57 @@ def test_candidate_presentation_uses_human_labels() -> None:
 
 def test_v2_brand_assets_cover_windows_icon_sizes() -> None:
     assets = Path(__file__).resolve().parents[1] / "assets"
-    with Image.open(assets / "app_brand_v2.png") as master:
-        assert master.size == (1024, 1024)
-        assert master.mode == "RGBA"
-        assert master.getchannel("A").getpixel((0, 0)) == 0
-        assert master.getchannel("A").getbbox() is not None
+    assert _png_metadata(assets / "app_brand_v2.png") == (1024, 1024, 0)
+    assert _png_metadata(assets / "app_icon_v2_64.png") == (64, 64, 0)
+    assert _png_metadata(assets / "app_brand_v2_40.png") == (40, 40, 0)
+    assert {(16, 16), (32, 32), (64, 64), (256, 256)} <= _ico_sizes(assets / "app_icon_v2.ico")
 
-    with Image.open(assets / "app_icon_v2_64.png") as small:
-        assert small.size == (64, 64)
-        assert small.mode == "RGBA"
 
-    with Image.open(assets / "app_brand_v2_40.png") as header_logo:
-        assert header_logo.size == (40, 40)
-        assert header_logo.getchannel("A").getpixel((0, 0)) == 0
+def _png_metadata(path: Path) -> tuple[int, int, int]:
+    """Return width, height, and top-left alpha for an 8-bit RGBA PNG."""
 
-    with Image.open(assets / "app_icon_v2.ico") as icon:
-        sizes = icon.info.get("sizes", set())
-        assert {(16, 16), (32, 32), (64, 64), (256, 256)} <= sizes
+    data = path.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    position = 8
+    idat = bytearray()
+    width = height = 0
+    while position < len(data):
+        length = struct.unpack(">I", data[position : position + 4])[0]
+        chunk_type = data[position + 4 : position + 8]
+        payload = data[position + 8 : position + 8 + length]
+        position += length + 12
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type = struct.unpack(">IIBB", payload[:10])
+            assert bit_depth == 8
+            assert color_type == 6
+        elif chunk_type == b"IDAT":
+            idat.extend(payload)
+        elif chunk_type == b"IEND":
+            break
+
+    scanline = bytearray(zlib.decompress(bytes(idat))[1 : 1 + width * 4])
+    filter_type = zlib.decompress(bytes(idat))[0]
+    for index, value in enumerate(scanline):
+        left = scanline[index - 4] if index >= 4 else 0
+        if filter_type == 1:
+            scanline[index] = (value + left) & 0xFF
+        elif filter_type == 2:
+            scanline[index] = value
+        elif filter_type == 3:
+            scanline[index] = (value + left // 2) & 0xFF
+        elif filter_type == 4:
+            scanline[index] = (value + left) & 0xFF
+        else:
+            assert filter_type == 0
+    return width, height, scanline[3]
+
+
+def _ico_sizes(path: Path) -> set[tuple[int, int]]:
+    data = path.read_bytes()
+    reserved, image_type, count = struct.unpack("<HHH", data[:6])
+    assert (reserved, image_type) == (0, 1)
+    sizes: set[tuple[int, int]] = set()
+    for index in range(count):
+        width, height = struct.unpack("BB", data[6 + index * 16 : 8 + index * 16])
+        sizes.add((width or 256, height or 256))
+    return sizes
