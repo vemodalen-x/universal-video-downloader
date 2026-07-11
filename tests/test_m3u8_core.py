@@ -375,3 +375,62 @@ def test_generic_webpage_falls_back_to_ytdlp(monkeypatch) -> None:
     assert candidates[0].source_type == "ytdlp"
     assert candidates[0].extractor == "Generic"
     assert candidates[0].container == "mp4"
+
+
+def test_supported_site_uses_ytdlp_before_static_scan(monkeypatch) -> None:
+    candidate = VideoCandidate(
+        title="Supported Site Video",
+        url="https://supported.example/watch/123",
+        source_url="https://supported.example/watch/123",
+        source_type="ytdlp",
+        container="mp4",
+        extractor="SupportedSite",
+    )
+    monkeypatch.setattr(m3u8_core, "_has_specific_ytdlp_extractor", lambda _url: True)
+    monkeypatch.setattr(m3u8_core, "_discover_ytdlp_candidates", lambda *_args, **_kwargs: [candidate])
+
+    def unexpected_static_fetch(*_args, **_kwargs):
+        raise AssertionError("static discovery should not run before a dedicated yt-dlp extractor")
+
+    monkeypatch.setattr(m3u8_core, "fetch_text_with_fallbacks", unexpected_static_fetch)
+
+    assert discover_candidates("https://supported.example/watch/123") == [candidate]
+
+
+def test_supported_site_falls_back_to_static_scan_when_ytdlp_fails(monkeypatch) -> None:
+    monkeypatch.setattr(m3u8_core, "_has_specific_ytdlp_extractor", lambda _url: True)
+
+    def failed_ytdlp(*_args, **_kwargs):
+        raise m3u8_core.HlsError("synthetic extractor failure")
+
+    monkeypatch.setattr(m3u8_core, "_discover_ytdlp_candidates", failed_ytdlp)
+    monkeypatch.setattr(
+        m3u8_core,
+        "fetch_text_with_fallbacks",
+        lambda *_args, **_kwargs: (
+            '<video src="https://cdn.example.com/fallback.mp4"></video>',
+            {"Referer": "https://supported.example/"},
+        ),
+    )
+    monkeypatch.setattr(m3u8_core, "_discover_urls_from_scripts", lambda *_args, **_kwargs: [])
+
+    candidates = discover_candidates("https://supported.example/watch/123")
+
+    assert len(candidates) == 1
+    assert candidates[0].source_type == "direct"
+    assert candidates[0].url == "https://cdn.example.com/fallback.mp4"
+
+
+def test_ytdlp_network_options_are_bounded() -> None:
+    options = m3u8_core._ytdlp_base_options("https://example.com/watch/123")
+
+    assert 0 < options["socket_timeout"] <= 20
+    assert 0 <= options["retries"] <= 3
+    assert 0 <= options["extractor_retries"] <= 3
+    assert 0 <= options["fragment_retries"] <= 5
+
+
+def test_xiaohongshu_has_a_dedicated_ytdlp_extractor() -> None:
+    url = "https://www.xiaohongshu.com/explore/deadbeefdeadbeefdeadbeef"
+
+    assert m3u8_core._has_specific_ytdlp_extractor(url) is True

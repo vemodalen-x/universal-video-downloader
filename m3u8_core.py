@@ -10,6 +10,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Iterable, Optional
@@ -567,6 +568,20 @@ def _discover_candidates_impl(
     if parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc:
         raise HlsError("请输入有效的 http 或 https 地址")
 
+    preferred_ytdlp_error: Optional[HlsError] = None
+    if not _looks_like_direct_video_url(source_url) and not _looks_like_playlist_url(source_url):
+        if _has_specific_ytdlp_extractor(source_url):
+            try:
+                return _discover_ytdlp_candidates(source_url, callback)
+            except HlsError as exc:
+                preferred_ytdlp_error = exc
+                _emit(
+                    callback,
+                    "log",
+                    level="warning",
+                    message="专用解析器未返回媒体，继续尝试网页扫描",
+                )
+
     page_headers = make_headers(referer or _default_referer(source_url))
     direct_urls: list[str] = []
     if _looks_like_direct_video_url(source_url):
@@ -596,6 +611,8 @@ def _discover_candidates_impl(
             )
 
     if not unique_urls and not direct_urls:
+        if preferred_ytdlp_error is not None:
+            raise preferred_ytdlp_error
         return _discover_ytdlp_candidates(source_url, callback)
 
     candidates: list[VideoCandidate] = []
@@ -665,6 +682,8 @@ def _discover_candidates_impl(
 
     candidates = rank_candidates(candidates)
     if not candidates:
+        if preferred_ytdlp_error is not None:
+            raise preferred_ytdlp_error
         return _discover_ytdlp_candidates(source_url, callback)
     return candidates
 
@@ -1623,10 +1642,34 @@ def _discover_urls_from_scripts(
     return urls
 
 
+@lru_cache(maxsize=256)
+def _has_specific_ytdlp_extractor(source_url: str) -> bool:
+    if yt_dlp is None:
+        return False
+    try:
+        from yt_dlp.extractor import gen_extractor_classes
+    except ImportError:
+        return False
+
+    for extractor_class in gen_extractor_classes():
+        if extractor_class.ie_key() == "Generic":
+            continue
+        try:
+            if extractor_class.suitable(source_url):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _ytdlp_base_options(source_url: str, referer: str = "") -> dict:
     options = {
         "format": _youtube_format_selector(),
         "http_headers": make_headers(referer or _default_referer(source_url)),
+        "socket_timeout": 15,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 3,
     }
     if shutil.which("ffmpeg"):
         options["merge_output_format"] = "mp4"
