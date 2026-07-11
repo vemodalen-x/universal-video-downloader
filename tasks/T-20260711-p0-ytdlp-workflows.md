@@ -15,7 +15,7 @@ judge:
   verdict: null
 approved_commands: []
 owning_chat: "chat-20260711-p0-ytdlp"
-heartbeat: 2026-07-11T12:59:13Z
+heartbeat: 2026-07-11T20:59:13+08:00
 ---
 
 # P0 yt-dlp workflows
