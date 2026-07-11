@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Priority-zero yt-dlp workflow update.
+
+### Added
+
+- Quality presets for best available, 1080p maximum, 720p maximum, and smaller-file downloads.
+- Playlist and multi-video expansion with up to 50 visible entries, multi-selection, select-all, and sequential queue execution.
+- Normalized format metadata for resolution, frame rate, dynamic range, codecs, bitrate, estimated size, and protocol.
+- Manual and automatic subtitle discovery, language selection, SRT/VTT/ASS output, and optional FFmpeg embedding.
+- FFmpeg capability detection with single-file format fallback when merging is unavailable.
+
+### Improved
+
+- Every queued item receives an independent history record and collision-safe output path.
+- A failed queue item no longer prevents remaining selected entries from downloading.
+- Media selection now distinguishes playlist titles while keeping detailed stream metadata in a dedicated view.
+
+### Tests
+
+- Added coverage for bounded quality selectors, subtitle postprocessors, no-FFmpeg behavior, playlist normalization, media metadata, and duplicate batch filenames.
+
 ## v1.1.0 - 2026-07-11
 
 Commercial workflow and reliability update.
