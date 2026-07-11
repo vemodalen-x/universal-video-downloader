@@ -3,17 +3,21 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Iterable, Optional
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from Crypto.Cipher import AES
@@ -35,6 +39,10 @@ USER_AGENT = (
 )
 
 DIRECT_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".m4v", ".flv", ".avi", ".wmv"}
+HISTORY_ACTIVE_STATES = {"preparing", "downloading", "paused"}
+HISTORY_FINAL_STATES = {"completed", "failed", "stopped", "interrupted"}
+HISTORY_STATES = HISTORY_ACTIVE_STATES | HISTORY_FINAL_STATES
+_HTTP_LOCAL = threading.local()
 
 
 class HlsError(Exception):
@@ -99,9 +107,164 @@ class VideoCandidate:
     duration: float = 0.0
     encrypted: bool = False
     source_type: str = "hls"
+    container: str = ""
+    extractor: str = ""
+
+
+@dataclass
+class DownloadRecord:
+    """Local task metadata; source URLs are stored without credentials or query strings."""
+
+    record_id: str
+    title: str
+    source_type: str
+    source_url: str
+    source_host: str
+    output_path: str
+    status: str
+    progress: float = 0.0
+    bytes_done: int = 0
+    updated_at: float = 0.0
+    error_code: str = ""
+    error_message: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "DownloadRecord":
+        status = str(payload.get("status") or "interrupted")
+        if status not in HISTORY_STATES:
+            status = "interrupted"
+        source_url = redact_url(str(payload.get("source_url") or ""))
+        source_host = urlparse(source_url).hostname or ""
+        return cls(
+            record_id=str(payload.get("record_id") or ""),
+            title=sanitize_file_name(str(payload.get("title") or "video"), "video"),
+            source_type=str(payload.get("source_type") or "unknown")[:24],
+            source_url=source_url,
+            source_host=source_host,
+            output_path=str(payload.get("output_path") or ""),
+            status=status,
+            progress=max(0.0, min(100.0, float(payload.get("progress") or 0.0))),
+            bytes_done=max(0, int(payload.get("bytes_done") or 0)),
+            updated_at=float(payload.get("updated_at") or 0.0),
+            error_code=str(payload.get("error_code") or "")[:48],
+            error_message=redact_sensitive_text(str(payload.get("error_message") or ""))[:500],
+        )
+
+
+@dataclass(frozen=True)
+class UserFacingError:
+    code: str
+    title: str
+    message: str
+    action: str
+    retryable: bool = True
+    detail: str = ""
+
+
+class DownloadHistoryStore:
+    """Persists a bounded local task library with atomic replace semantics."""
+
+    def __init__(self, path: Path, limit: int = 100) -> None:
+        self.path = path
+        self.limit = max(10, limit)
+        self._lock = threading.Lock()
+
+    def load(self) -> list[DownloadRecord]:
+        with self._lock:
+            if not self.path.exists():
+                return []
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                return []
+        records = payload.get("records", []) if isinstance(payload, dict) else []
+        result: list[DownloadRecord] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            try:
+                record = DownloadRecord.from_dict(item)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if record.record_id:
+                result.append(record)
+        return sorted(result, key=lambda item: item.updated_at, reverse=True)[: self.limit]
+
+    def save(self, records: Iterable[DownloadRecord]) -> None:
+        normalized = [DownloadRecord.from_dict(asdict(item)) for item in records]
+        ordered = sorted(normalized, key=lambda item: item.updated_at, reverse=True)[: self.limit]
+        payload = {"version": 1, "records": [asdict(item) for item in ordered]}
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp_path.replace(self.path)
+
+    def upsert(self, record: DownloadRecord) -> list[DownloadRecord]:
+        records = [item for item in self.load() if item.record_id != record.record_id]
+        records.insert(0, record)
+        self.save(records)
+        return records[: self.limit]
+
+    def clear_completed(self) -> list[DownloadRecord]:
+        records = [item for item in self.load() if item.status != "completed"]
+        self.save(records)
+        return records
+
+
+class CoalescingEventBuffer:
+    """Keeps terminal events ordered while collapsing high-frequency UI updates."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._regular: deque[tuple[int, str, dict]] = deque()
+        self._coalesced: dict[tuple[str, object], tuple[int, str, dict]] = {}
+
+    def put(self, event: str, payload: dict) -> None:
+        with self._lock:
+            self._sequence += 1
+            item = (self._sequence, event, payload)
+            if event == "progress":
+                self._coalesced[(event, None)] = item
+            elif event == "segment":
+                self._coalesced[(event, payload.get("index"))] = item
+            else:
+                self._regular.append(item)
+
+    def drain(self) -> list[tuple[str, dict]]:
+        with self._lock:
+            items = list(self._regular) + list(self._coalesced.values())
+            self._regular.clear()
+            self._coalesced.clear()
+        items.sort(key=lambda item: item[0])
+        return [(event, payload) for _sequence, event, payload in items]
 
 
 EventCallback = Callable[[str, dict], None]
+
+
+def _http_session() -> requests.Session:
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is not None:
+        return session
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        status=3,
+        backoff_factor=0.45,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    _HTTP_LOCAL.session = session
+    return session
 
 
 def make_headers(referer: str = "") -> dict[str, str]:
@@ -116,11 +279,11 @@ def make_headers(referer: str = "") -> dict[str, str]:
 
 
 def fetch_text(url: str, headers: Optional[dict[str, str]] = None, timeout: int = 25) -> str:
-    response = requests.get(url, headers=headers or make_headers(), timeout=timeout)
-    response.raise_for_status()
-    if not response.encoding:
-        response.encoding = "utf-8"
-    return response.text
+    with _http_session().get(url, headers=headers or make_headers(), timeout=(10, timeout)) as response:
+        response.raise_for_status()
+        if not response.encoding:
+            response.encoding = "utf-8"
+        return response.text
 
 
 def fetch_text_with_fallbacks(
@@ -153,19 +316,25 @@ def fetch_binary(
     request_headers = dict(headers or make_headers())
     start_at = path.stat().st_size if path.exists() else 0
     mode = "ab" if start_at else "wb"
+    request_headers["Accept-Encoding"] = "identity"
     if start_at:
         request_headers["Range"] = f"bytes={start_at}-"
 
-    with requests.get(url, headers=request_headers, stream=True, timeout=(10, 45)) as response:
+    with _http_session().get(url, headers=request_headers, stream=True, timeout=(10, 45)) as response:
         if response.status_code == 416:
             path.unlink(missing_ok=True)
             return fetch_binary(url, path, headers, stop_event, chunk_size)
         response.raise_for_status()
 
+        if start_at and response.status_code == 206 and _response_range_start(response) != start_at:
+            path.unlink(missing_ok=True)
+            return fetch_binary(url, path, headers, stop_event, chunk_size)
+
         if start_at and response.status_code != 206:
             mode = "wb"
             start_at = 0
 
+        expected_total = _response_total_size(response, start_at)
         written = start_at
         with path.open(mode + "") as handle:
             for chunk in response.iter_content(chunk_size=chunk_size):
@@ -175,6 +344,8 @@ def fetch_binary(
                     continue
                 handle.write(chunk)
                 written += len(chunk)
+        if expected_total > 0 and written < expected_total:
+            raise HlsError(f"连接提前结束：预期 {expected_total} 字节，实际 {written} 字节")
         return written
 
 
@@ -357,6 +528,8 @@ def load_playlist_info_with_fallbacks(
 def load_best_media_playlist(url: str, headers: Optional[dict[str, str]] = None) -> MediaPlaylist:
     info = load_playlist_info(url, headers=headers)
     if info.media:
+        if info.media.has_byterange:
+            raise PlaylistParseError("该 HLS 使用字节范围分片，请改用通用解析器下载")
         return info.media
     if not info.variants:
         raise PlaylistParseError("没有发现可下载的视频分片")
@@ -365,6 +538,8 @@ def load_best_media_playlist(url: str, headers: Optional[dict[str, str]] = None)
     nested = load_playlist_info(best.url, headers=headers)
     if not nested.media:
         raise PlaylistParseError("清晰度列表没有指向可下载的视频分片")
+    if nested.media.has_byterange:
+        raise PlaylistParseError("该 HLS 使用字节范围分片，请改用通用解析器下载")
     return nested.media
 
 
@@ -388,6 +563,10 @@ def _discover_candidates_impl(
     if _looks_like_youtube_url(source_url):
         return _discover_youtube_candidates(source_url, callback)
 
+    parsed_source = urlparse(source_url)
+    if parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc:
+        raise HlsError("请输入有效的 http 或 https 地址")
+
     page_headers = make_headers(referer or _default_referer(source_url))
     direct_urls: list[str] = []
     if _looks_like_direct_video_url(source_url):
@@ -396,18 +575,28 @@ def _discover_candidates_impl(
         unique_urls = [source_url]
         page_referer = referer
     else:
-        text, page_headers = fetch_text_with_fallbacks(
-            source_url,
-            _header_candidates(source_url, referer=referer, source_url=source_url),
-        )
-        page_referer = page_headers.get("Referer") or source_url
-        discovered_urls = find_m3u8_urls(source_url, text)
-        discovered_urls.extend(_discover_urls_from_scripts(source_url, text, page_headers, callback))
-        unique_urls = _dedupe(discovered_urls)
-        direct_urls = find_direct_video_urls(source_url, text)
+        try:
+            text, page_headers = fetch_text_with_fallbacks(
+                source_url,
+                _header_candidates(source_url, referer=referer, source_url=source_url),
+            )
+            page_referer = page_headers.get("Referer") or source_url
+            discovered_urls = find_m3u8_urls(source_url, text)
+            discovered_urls.extend(_discover_urls_from_scripts(source_url, text, page_headers, callback))
+            unique_urls = _dedupe(discovered_urls)
+            direct_urls = find_direct_video_urls(source_url, text)
+        except Exception as exc:
+            page_referer = referer or source_url
+            unique_urls = []
+            _emit(
+                callback,
+                "log",
+                level="warning",
+                message=f"网页直接扫描未成功，切换通用解析器：{classify_error(exc).title}",
+            )
 
     if not unique_urls and not direct_urls:
-        raise HlsError("页面源码里没有发现可下载的视频地址。动态加载站点可能需要浏览器上下文、登录态或专用解析器。")
+        return _discover_ytdlp_candidates(source_url, callback)
 
     candidates: list[VideoCandidate] = []
     seen: set[str] = set()
@@ -422,11 +611,19 @@ def _discover_candidates_impl(
         try:
             info, effective_headers = load_playlist_info_with_fallbacks(playlist_url, header_candidates)
         except Exception as exc:
-            _emit(callback, "log", level="warning", message=f"跳过无效 m3u8：{playlist_url} ({exc})")
+            _emit(
+                callback,
+                "log",
+                level="warning",
+                message=f"跳过无效 m3u8：{redact_url(playlist_url)} ({redact_sensitive_text(str(exc))})",
+            )
             continue
 
         effective_referer = effective_headers.get("Referer", "")
         if info.media:
+            if info.media.has_byterange:
+                _emit(callback, "log", level="info", message="检测到 HLS 字节范围分片，切换通用解析器")
+                continue
             candidate = _candidate_from_media(info.media, source_url, referer=effective_referer)
             if candidate.url not in seen:
                 candidates.append(candidate)
@@ -441,6 +638,9 @@ def _discover_candidates_impl(
                 )
                 media_info, media_headers = load_playlist_info_with_fallbacks(variant.url, variant_headers)
                 if not media_info.media:
+                    continue
+                if media_info.media.has_byterange:
+                    _emit(callback, "log", level="info", message="跳过原生下载不支持的 HLS 字节范围变体")
                     continue
                 candidate = _candidate_from_media(
                     media_info.media,
@@ -463,9 +663,9 @@ def _discover_candidates_impl(
                 candidates.append(candidate)
                 seen.add(candidate.url)
 
-    candidates.sort(key=lambda item: candidate_score(item), reverse=True)
+    candidates = rank_candidates(candidates)
     if not candidates:
-        raise HlsError("发现了视频地址，但没有解析出可下载的视频内容。")
+        return _discover_ytdlp_candidates(source_url, callback)
     return candidates
 
 
@@ -483,11 +683,20 @@ def _discover_youtube_candidates(
     source_url: str,
     callback: Optional[EventCallback],
 ) -> list[VideoCandidate]:
-    if yt_dlp is None:
-        raise HlsError("YouTube 支持需要 yt-dlp，请先运行 python -m pip install -r requirements.txt")
+    return _discover_ytdlp_candidates(source_url, callback, source_type="youtube")
 
-    _emit(callback, "log", level="info", message="正在使用 yt-dlp 解析 YouTube 视频")
-    options = _youtube_base_options()
+
+def _discover_ytdlp_candidates(
+    source_url: str,
+    callback: Optional[EventCallback],
+    source_type: str = "ytdlp",
+) -> list[VideoCandidate]:
+    if yt_dlp is None:
+        raise HlsError("通用网页解析需要 yt-dlp，请先运行 python -m pip install -r requirements.txt")
+
+    label = "YouTube" if source_type == "youtube" else "网页"
+    _emit(callback, "log", level="info", message=f"正在使用 yt-dlp 解析{label}媒体")
+    options = _ytdlp_base_options(source_url)
     options.update(
         {
             "skip_download": True,
@@ -500,10 +709,10 @@ def _discover_youtube_candidates(
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(source_url, download=False)
     except Exception as exc:
-        raise HlsError(f"YouTube 解析失败：{exc}") from exc
+        raise HlsError(f"通用媒体解析失败：{redact_sensitive_text(str(exc))}") from exc
 
     if not isinstance(info, dict):
-        raise HlsError("YouTube 没有返回可下载的视频信息")
+        raise HlsError("通用解析器没有返回可下载的视频信息")
     if info.get("_type") == "playlist" and info.get("entries"):
         first = next((item for item in info.get("entries") or [] if item), None)
         if isinstance(first, dict):
@@ -513,24 +722,27 @@ def _discover_youtube_candidates(
     resolution = _youtube_resolution(info)
     bandwidth = _youtube_bandwidth(info)
     duration = float(info.get("duration") or 0.0)
+    extractor = str(info.get("extractor_key") or info.get("extractor") or "yt-dlp")
     display_title = title
     if resolution:
-        display_title = f"{display_title} / YouTube / {resolution}"
+        display_title = f"{display_title} / {label} / {resolution}"
     else:
-        display_title = f"{display_title} / YouTube"
+        display_title = f"{display_title} / {label}"
 
     return [
         VideoCandidate(
             title=display_title,
             url=source_url,
             source_url=source_url,
-            referer="https://www.youtube.com/",
+            referer=_default_referer(source_url),
             bandwidth=bandwidth,
             resolution=resolution,
             segment_count=100,
             duration=duration,
             encrypted=False,
-            source_type="youtube",
+            source_type=source_type,
+            container=str(info.get("ext") or "mp4"),
+            extractor=extractor,
         )
     ]
 
@@ -581,12 +793,106 @@ def candidate_score(candidate: VideoCandidate) -> tuple[int, int, int]:
     return (_resolution_area(candidate.resolution), candidate.bandwidth, candidate.segment_count)
 
 
+def candidate_identity(candidate: VideoCandidate) -> tuple[str, str, str]:
+    parsed = urlsplit(candidate.url)
+    stable_url = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
+    return candidate.source_type, stable_url, candidate.resolution.lower()
+
+
+def rank_candidates(candidates: Iterable[VideoCandidate]) -> list[VideoCandidate]:
+    """Deduplicate signed URL variants and return best-quality media first."""
+
+    selected: dict[tuple[str, str, str], VideoCandidate] = {}
+    for candidate in candidates:
+        identity = candidate_identity(candidate)
+        current = selected.get(identity)
+        if current is None or candidate_score(candidate) > candidate_score(current):
+            selected[identity] = candidate
+    return sorted(selected.values(), key=candidate_score, reverse=True)
+
+
 def sanitize_file_name(value: str, default: str = "video") -> str:
     value = unquote(value).strip()
     value = re.sub(r"[\\/:*?\"<>|]+", "_", value)
     value = re.sub(r"\s+", " ", value)
     value = value.strip(" .")
     return value[:120] or default
+
+
+def redact_url(value: str) -> str:
+    """Remove credentials, query parameters, and fragments from a URL before persistence or logging."""
+
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return value.split("?", 1)[0].split("#", 1)[0]
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        host = f"{host}:{port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
+def redact_sensitive_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"https?://[^\s'\"<>]+",
+        lambda match: redact_url(match.group(0).rstrip("),.;")) + match.group(0)[len(match.group(0).rstrip("),.;")) :],
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?i)\b(authorization|cookie|set-cookie|token|access_token|signature|sig)\s*[:=]\s*([^\s&;,]+)",
+        r"\1=[已隐藏]",
+        text,
+    )
+    return text[:1000]
+
+
+def default_history_path() -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    return base / "UniversalVideoDownloader" / "history.json"
+
+
+def classify_error(error: object) -> UserFacingError:
+    """Translate network and dependency failures into concise recovery guidance."""
+
+    detail = redact_sensitive_text(str(error))
+    lowered = detail.lower()
+    if isinstance(error, requests.Timeout) or "timed out" in lowered or "timeout" in lowered:
+        return UserFacingError("network_timeout", "连接超时", "服务器在限定时间内没有响应。", "检查网络后重试，或降低并发任务数。", True, detail)
+    if isinstance(error, requests.ConnectionError) or "connection" in lowered and "failed" in lowered:
+        return UserFacingError("network_unreachable", "无法连接服务器", "网络连接没有建立。", "确认地址可在浏览器访问，并检查代理、防火墙或 DNS。", True, detail)
+
+    response = getattr(error, "response", None)
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    match = re.search(r"\b(401|403|404|429|5\d\d)\b", detail)
+    if not status_code and match:
+        status_code = int(match.group(1))
+    if status_code in {401, 403}:
+        return UserFacingError("access_denied", "资源拒绝访问", "服务器要求有效的访问上下文，或链接已经过期。", "先在浏览器确认你有权访问；必要时更新 Referer 后重试。", False, detail)
+    if status_code == 404:
+        return UserFacingError("not_found", "资源不存在", "视频地址已失效或被移动。", "返回原视频页面重新解析最新地址。", False, detail)
+    if status_code == 429:
+        return UserFacingError("rate_limited", "请求过于频繁", "服务器暂时限制了请求。", "稍后重试，并降低并发任务数。", True, detail)
+    if status_code >= 500:
+        return UserFacingError("server_error", "视频服务器异常", "远端服务暂时不可用。", "保留续传缓存，稍后直接重试。", True, detail)
+    if "yt-dlp" in lowered and ("install" in lowered or "需要" in detail):
+        return UserFacingError("missing_ytdlp", "缺少通用解析组件", "当前安装中没有可用的 yt-dlp。", "重新运行安装程序或执行 requirements.txt 依赖安装。", False, detail)
+    if "ffmpeg" in lowered:
+        return UserFacingError("missing_ffmpeg", "缺少音视频合并组件", "当前任务需要 ffmpeg 才能生成完整文件。", "安装 ffmpeg 并加入 PATH 后重试。", False, detail)
+    if isinstance(error, PermissionError) or "permission denied" in lowered:
+        return UserFacingError("permission_denied", "无法写入文件", "保存目录没有写入权限，或文件正在被占用。", "更换保存目录，或关闭正在使用该文件的程序。", False, detail)
+    if "no space left" in lowered or "磁盘空间" in detail:
+        return UserFacingError("disk_full", "磁盘空间不足", "目标磁盘没有足够空间。", "释放空间或更换保存目录后继续任务。", False, detail)
+    if isinstance(error, PlaylistParseError) or "m3u8" in lowered and "解析" in detail:
+        return UserFacingError("playlist_invalid", "播放列表无法解析", "链接可能已经过期，或不是标准 HLS 播放列表。", "返回视频页面重新解析，或检查 Referer。", False, detail)
+    return UserFacingError("unknown", "任务未完成", "下载器遇到未分类的错误。", "查看活动日志中的技术详情后重试。", True, detail)
 
 
 class DownloadJob:
@@ -614,6 +920,7 @@ class DownloadJob:
         self.status: dict[int, str] = {}
         self.errors: dict[int, str] = {}
         self.key_cache: dict[str, bytes] = {}
+        self.bytes_done = 0
         self.cache_dir = self._cache_root()
         self.segment_dir = self.cache_dir / "segments"
         self.manifest_path = self.cache_dir / "manifest.json"
@@ -708,9 +1015,14 @@ class DownloadJob:
     def _prepare(self) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.segment_dir.mkdir(parents=True, exist_ok=True)
+        bytes_done = 0
         for segment in self.playlist.segments:
             path = self._segment_path(segment)
             self.status[segment.index] = "done" if path.exists() and path.stat().st_size > 0 else "pending"
+            if self.status[segment.index] == "done":
+                bytes_done += path.stat().st_size
+        with self.lock:
+            self.bytes_done = bytes_done
         self._write_manifest()
 
     def _worker(self, queue: Queue[int]) -> None:
@@ -767,6 +1079,8 @@ class DownloadJob:
             part_path.unlink(missing_ok=True)
         else:
             part_path.replace(final_path)
+        with self.lock:
+            self.bytes_done += final_path.stat().st_size
 
     def _decrypt_segment(self, segment: Segment, data: bytes) -> bytes:
         if AES is None or unpad is None:
@@ -787,11 +1101,11 @@ class DownloadJob:
             cached = self.key_cache.get(url)
         if cached:
             return cached
-        response = requests.get(url, headers=self.headers, timeout=20)
-        response.raise_for_status()
-        key = response.content
+        with _http_session().get(url, headers=self.headers, timeout=(10, 20)) as response:
+            response.raise_for_status()
+            key = response.content
         if len(key) != 16:
-            raise HlsError(f"AES key 长度异常：{url}")
+            raise HlsError(f"AES key 长度异常：{redact_url(url)}")
         with self.lock:
             self.key_cache[url] = key
         return key
@@ -805,14 +1119,10 @@ class DownloadJob:
     def _emit_progress(self) -> None:
         with self.lock:
             values = list(self.status.values())
+            bytes_done = self.bytes_done
         done = values.count("done")
         failed = values.count("error")
         downloading = values.count("downloading")
-        bytes_done = 0
-        for segment in self.playlist.segments:
-            path = self._segment_path(segment)
-            if path.exists():
-                bytes_done += path.stat().st_size
         _emit(
             self.callback,
             "progress",
@@ -852,11 +1162,13 @@ class YouTubeDownloadJob:
         url: str,
         output_path: Path,
         concurrency: int = 4,
+        referer: str = "",
         callback: Optional[EventCallback] = None,
     ) -> None:
         self.url = url
         self.output_path = output_path
         self.concurrency = max(1, min(16, concurrency))
+        self.referer = referer
         self.callback = callback
         self.pause_event = threading.Event()
         self.pause_event.set()
@@ -899,7 +1211,9 @@ class YouTubeDownloadJob:
             )
             self._emit_progress(done=0, downloading=1, bytes_done=0)
 
-            options = _youtube_base_options()
+            options = _ytdlp_base_options(self.url, self.referer)
+            if _looks_like_youtube_url(self.url):
+                options["extractor_args"] = {"youtube": {"player_client": ["default", "ios"]}}
             options.update(
                 {
                     "outtmpl": self._output_template(),
@@ -930,7 +1244,7 @@ class YouTubeDownloadJob:
             if self.stop_event.is_set():
                 _emit(self.callback, "stopped")
                 return
-            _emit(self.callback, "fatal", message=f"YouTube 下载失败：{exc}")
+            _emit(self.callback, "fatal", message=f"媒体下载失败：{redact_sensitive_text(str(exc))}")
 
     def _progress_hook(self, data: dict) -> None:
         if self.stop_event.is_set():
@@ -1074,14 +1388,19 @@ class DirectDownloadJob:
         part_path = self.output_path.with_suffix(self.output_path.suffix + ".part")
         start_at = part_path.stat().st_size if part_path.exists() else 0
         request_headers = dict(self.headers)
+        request_headers["Accept-Encoding"] = "identity"
         if start_at:
             request_headers["Range"] = f"bytes={start_at}-"
 
-        with requests.get(self.url, headers=request_headers, stream=True, timeout=(10, 45)) as response:
+        with _http_session().get(self.url, headers=request_headers, stream=True, timeout=(10, 45)) as response:
             if response.status_code == 416:
                 part_path.unlink(missing_ok=True)
                 return self._download()
             response.raise_for_status()
+
+            if start_at and response.status_code == 206 and _response_range_start(response) != start_at:
+                part_path.unlink(missing_ok=True)
+                return self._download()
 
             mode = "ab" if start_at and response.status_code == 206 else "wb"
             if mode == "wb":
@@ -1102,6 +1421,9 @@ class DirectDownloadJob:
                     handle.write(chunk)
                     written += len(chunk)
                     self._emit_download_progress(written, total_size)
+
+            if total_size > 0 and written < total_size:
+                raise HlsError(f"连接提前结束：预期 {total_size} 字节，实际 {written} 字节")
 
         part_path.replace(self.output_path)
 
@@ -1159,6 +1481,7 @@ def _candidate_from_media(
         segment_count=len(media.segments),
         duration=media.total_duration,
         encrypted=media.encrypted,
+        container="m3u8",
     )
 
 
@@ -1181,6 +1504,7 @@ def _candidate_from_direct_url(
         referer=referer,
         segment_count=100,
         source_type="direct",
+        container=suffix or "video",
     )
 
 
@@ -1290,18 +1614,28 @@ def _discover_urls_from_scripts(
             script_text = fetch_text(script_src, headers=headers, timeout=15)
             urls.extend(find_m3u8_urls(script_src, script_text))
         except Exception as exc:
-            _emit(callback, "log", level="debug", message=f"跳过脚本：{script_src} ({exc})")
+            _emit(
+                callback,
+                "log",
+                level="debug",
+                message=f"跳过脚本：{redact_url(script_src)} ({redact_sensitive_text(str(exc))})",
+            )
     return urls
 
 
-def _youtube_base_options() -> dict:
+def _ytdlp_base_options(source_url: str, referer: str = "") -> dict:
     options = {
         "format": _youtube_format_selector(),
-        "http_headers": make_headers("https://www.youtube.com/"),
-        "extractor_args": {"youtube": {"player_client": ["default", "ios"]}},
+        "http_headers": make_headers(referer or _default_referer(source_url)),
     }
     if shutil.which("ffmpeg"):
         options["merge_output_format"] = "mp4"
+    return options
+
+
+def _youtube_base_options() -> dict:
+    options = _ytdlp_base_options("https://www.youtube.com/")
+    options["extractor_args"] = {"youtube": {"player_client": ["default", "ios"]}}
     return options
 
 
@@ -1381,6 +1715,13 @@ def _response_total_size(response: requests.Response, start_at: int) -> int:
     if response.status_code == 206:
         return start_at + content_length
     return content_length
+
+
+def _response_range_start(response: requests.Response) -> Optional[int]:
+    """Return the first byte declared by a 206 response, or None when it is malformed."""
+
+    match = re.match(r"bytes\s+(\d+)-\d+/", response.headers.get("Content-Range", ""), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _normalize_iv(value: Optional[str]) -> Optional[str]:

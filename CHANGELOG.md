@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.1.0 - 2026-07-11
+
+Commercial workflow and reliability update.
+
+### Added
+
+- Windows file and product version metadata for v1.1.0 release builds.
+- Portable-package documentation, license files, third-party notices, and SHA-256 release checksum.
+- Generic webpage fallback through yt-dlp when static HTML and script discovery find no media.
+- Persistent local task history with interrupted-session restoration and completed-task cleanup.
+- Actionable error categories for timeouts, access denial, missing resources, rate limiting, server errors, dependencies, permissions, and disk space.
+- Human-readable candidate columns for quality, format, protocol, duration, bitrate, and origin.
+- Inline success, warning, and error notices that do not interrupt the workflow with completion dialogs.
+
+### Improved
+
+- Replaced the demo-style icon with a professional v2 brand mark designed for clear recognition at Windows taskbar and shortcut sizes.
+- Integrated the v2 mark across the application header, window icon, packaged executable, and desktop shortcut.
+- Shared HTTP retry policy with bounded backoff and `Retry-After` handling for transient responses.
+- Hardened Range continuation with identity encoding, `Content-Range` start validation, and incomplete-response detection.
+- Signed URLs, credentials, query parameters, and common authorization fields are redacted before logging or persistence.
+- Candidate results are deduplicated by stable media identity and sorted by quality.
+- Progress and segment events are coalesced to a 10 Hz UI refresh budget.
+- HLS byte accounting is incremental instead of repeatedly scanning every downloaded segment.
+- Segment visualization is capped at 160 aggregate blocks for stable rendering on long playlists.
+- Download speed uses smoothing and now includes estimated remaining time.
+- Desktop layout now keeps all primary controls visible at the 1040x720 minimum window size.
+
+### Tests
+
+- Added coverage for history round trips and malformed records, event coalescing, URL redaction, error mapping, generic yt-dlp fallback, candidate deduplication, output collision handling, and presentation labels.
+
 ## v1.0.0 - 2026-07-05
 
 Initial major release.
