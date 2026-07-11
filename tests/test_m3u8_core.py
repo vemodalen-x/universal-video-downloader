@@ -430,6 +430,117 @@ def test_ytdlp_network_options_are_bounded() -> None:
     assert 0 <= options["fragment_retries"] <= 5
 
 
+def test_ytdlp_quality_and_subtitle_options_use_ffmpeg_when_available() -> None:
+    preferences = m3u8_core.DownloadPreferences(
+        quality="1080p",
+        subtitle_languages=("zh-Hans",),
+        include_auto_subtitles=True,
+        subtitle_format="srt",
+        embed_subtitles=True,
+    )
+
+    options = m3u8_core.build_ytdlp_options(
+        "https://example.com/watch/123",
+        preferences=preferences,
+        ffmpeg_available=True,
+    )
+
+    assert "height<=?1080" in options["format"]
+    assert options["merge_output_format"] == "mp4"
+    assert options["writesubtitles"] is True
+    assert options["writeautomaticsub"] is True
+    assert options["subtitleslangs"] == ["zh-Hans"]
+    assert [processor["key"] for processor in options["postprocessors"]] == [
+        "FFmpegSubtitlesConvertor",
+        "FFmpegEmbedSubtitle",
+    ]
+
+
+def test_ytdlp_without_ffmpeg_uses_single_file_format_and_skips_embedding() -> None:
+    preferences = m3u8_core.DownloadPreferences(
+        quality="720p",
+        subtitle_languages=("en",),
+        embed_subtitles=True,
+    )
+
+    options = m3u8_core.build_ytdlp_options(
+        "https://example.com/watch/123",
+        preferences=preferences,
+        ffmpeg_available=False,
+    )
+
+    assert "+" not in options["format"]
+    assert "height<=?720" in options["format"]
+    assert "merge_output_format" not in options
+    assert "postprocessors" not in options
+
+
+def test_ytdlp_playlist_exposes_entries_formats_and_subtitles(monkeypatch) -> None:
+    class FakeYoutubeDL:
+        def __init__(self, options: dict) -> None:
+            assert options["noplaylist"] is False
+            assert options["playlistend"] == 50
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict:
+            return {
+                "_type": "playlist",
+                "title": "Example Playlist",
+                "entries": [
+                    {
+                        "id": "one",
+                        "title": "First Video",
+                        "webpage_url": "https://example.com/watch/one",
+                        "extractor_key": "Example",
+                        "formats": [
+                            {
+                                "format_id": "1080",
+                                "ext": "mp4",
+                                "width": 1920,
+                                "height": 1080,
+                                "fps": 60,
+                                "dynamic_range": "HDR10",
+                                "vcodec": "avc1",
+                                "acodec": "none",
+                                "tbr": 4200,
+                                "filesize": 4096,
+                                "protocol": "https",
+                            }
+                        ],
+                        "subtitles": {"zh-Hans": [{"ext": "vtt", "name": "Chinese"}]},
+                        "automatic_captions": {"en": [{"ext": "vtt"}]},
+                    },
+                    {
+                        "id": "two",
+                        "title": "Second Video",
+                        "webpage_url": "https://example.com/watch/two",
+                    },
+                ],
+            }
+
+    monkeypatch.setattr(m3u8_core, "yt_dlp", type("FakeYtDlp", (), {"YoutubeDL": FakeYoutubeDL}))
+
+    candidates = m3u8_core._discover_ytdlp_candidates("https://example.com/playlist", None)
+
+    assert len(candidates) == 2
+    assert candidates[0].url == "https://example.com/watch/one"
+    assert candidates[0].playlist_index == 1
+    assert candidates[0].playlist_count == 2
+    assert candidates[0].playlist_title == "Example Playlist"
+    assert candidates[0].formats[0].resolution == "1920x1080"
+    assert candidates[0].formats[0].has_video is True
+    assert [(track.language, track.automatic) for track in candidates[0].subtitles] == [
+        ("zh-Hans", False),
+        ("en", True),
+    ]
+    assert candidates[1].url == "https://example.com/watch/two"
+
+
 def test_xiaohongshu_has_a_dedicated_ytdlp_extractor() -> None:
     url = "https://www.xiaohongshu.com/explore/deadbeefdeadbeefdeadbeef"
 

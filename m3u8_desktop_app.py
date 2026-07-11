@@ -19,6 +19,7 @@ from m3u8_core import (
     DirectDownloadJob,
     DownloadHistoryStore,
     DownloadJob,
+    DownloadPreferences,
     DownloadRecord,
     HlsError,
     UserFacingError,
@@ -28,6 +29,7 @@ from m3u8_core import (
     classify_error,
     default_history_path,
     discover_candidates,
+    ffmpeg_capability,
     load_best_media_playlist,
     make_headers,
     redact_url,
@@ -57,6 +59,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.current_candidate: VideoCandidate | None = None
         self.current_record_id = ""
         self.download_thread: threading.Thread | None = None
+        self.queue_stop_event = threading.Event()
+        self.queue_total = 0
+        self.queue_completed = 0
+        self.queue_failed = 0
+        self.subtitle_choices: dict[str, tuple[str, bool]] = {}
         self.is_downloading = False
         self.advanced_visible = False
 
@@ -84,6 +91,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.file_name_var = tk.StringVar(value="video.mp4")
         self.concurrency_var = tk.IntVar(value=8)
         self.keep_cache_var = tk.BooleanVar(value=True)
+        self.quality_var = tk.StringVar(value="最佳质量")
+        self.subtitle_var = tk.StringVar(value="不下载字幕")
+        self.subtitle_format_var = tk.StringVar(value="srt")
+        self.auto_subtitle_var = tk.BooleanVar(value=False)
+        self.embed_subtitle_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="准备就绪")
         self.selection_var = tk.StringVar(value="输入链接并解析后，这里会显示可下载媒体")
         self.progress_detail_var = tk.StringVar(value="尚未开始任务")
@@ -272,19 +284,18 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.best_button.grid(row=0, column=1, sticky=tk.E)
         ttk.Label(candidates_frame, textvariable=self.selection_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(7, 10))
 
-        columns = ("quality", "format", "protocol", "duration", "bitrate", "origin")
-        self.candidate_tree = ttk.Treeview(candidates_frame, columns=columns, show="headings", selectmode="browse", height=8)
+        columns = ("title", "quality", "format", "duration", "origin")
+        self.candidate_tree = ttk.Treeview(candidates_frame, columns=columns, show="headings", selectmode="extended", height=8)
         headings = {
+            "title": ("标题", 190),
             "quality": ("画质", 90),
             "format": ("格式", 70),
-            "protocol": ("协议", 75),
             "duration": ("时长", 75),
-            "bitrate": ("码率", 90),
-            "origin": ("来源", 175),
+            "origin": ("来源", 115),
         }
         for key, (label, width) in headings.items():
             self.candidate_tree.heading(key, text=label)
-            self.candidate_tree.column(key, width=width, minwidth=65, stretch=(key == "origin"))
+            self.candidate_tree.column(key, width=width, minwidth=65, stretch=(key == "title"))
         tree_scroll = ttk.Scrollbar(candidates_frame, orient=tk.VERTICAL, command=self.candidate_tree.yview)
         self.candidate_tree.configure(yscrollcommand=tree_scroll.set)
         self.candidate_tree.grid(row=2, column=0, sticky=tk.NSEW)
@@ -312,12 +323,49 @@ class UniversalVideoDownloaderApp(tk.Tk):
         file_row.columnconfigure(1, weight=1)
         ttk.Label(file_row, text="文件", style="Muted.TLabel", width=5).grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(file_row, textvariable=self.file_name_var).grid(row=0, column=1, sticky=tk.EW)
-        ttk.Separator(action).grid(row=3, column=0, sticky=tk.EW, pady=3)
+
+        quality_row = ttk.Frame(action, style="Surface.TFrame")
+        quality_row.grid(row=3, column=0, sticky=tk.EW, pady=(4, 0))
+        quality_row.columnconfigure(1, weight=1)
+        ttk.Label(quality_row, text="质量", style="Muted.TLabel", width=5).grid(row=0, column=0, sticky=tk.W)
+        self.quality_combo = ttk.Combobox(
+            quality_row,
+            textvariable=self.quality_var,
+            values=("最佳质量", "最高 1080p", "最高 720p", "较小文件"),
+            state="readonly",
+        )
+        self.quality_combo.grid(row=0, column=1, sticky=tk.EW)
+
+        subtitle_row = ttk.Frame(action, style="Surface.TFrame")
+        subtitle_row.grid(row=4, column=0, sticky=tk.EW, pady=(4, 0))
+        subtitle_row.columnconfigure(1, weight=1)
+        ttk.Label(subtitle_row, text="字幕", style="Muted.TLabel", width=5).grid(row=0, column=0, sticky=tk.W)
+        self.subtitle_combo = ttk.Combobox(subtitle_row, textvariable=self.subtitle_var, values=("不下载字幕",), state="readonly")
+        self.subtitle_combo.grid(row=0, column=1, sticky=tk.EW, padx=(0, 6))
+        self.subtitle_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_subtitle_selected())
+        ttk.Combobox(
+            subtitle_row,
+            textvariable=self.subtitle_format_var,
+            values=("srt", "vtt", "ass"),
+            state="readonly",
+            width=5,
+        ).grid(row=0, column=2)
+
+        subtitle_options = ttk.Frame(action, style="Surface.TFrame")
+        subtitle_options.grid(row=5, column=0, sticky=tk.EW, pady=(2, 0))
+        self.auto_subtitle_check = ttk.Checkbutton(subtitle_options, text="包含自动字幕", variable=self.auto_subtitle_var)
+        self.auto_subtitle_check.pack(side=tk.LEFT)
+        self.embed_subtitle_check = ttk.Checkbutton(subtitle_options, text="嵌入视频", variable=self.embed_subtitle_var)
+        self.embed_subtitle_check.pack(side=tk.RIGHT)
+        if not ffmpeg_capability().available:
+            self.embed_subtitle_check.configure(state=tk.DISABLED)
+
+        ttk.Separator(action).grid(row=6, column=0, sticky=tk.EW, pady=4)
 
         self.start_button = ttk.Button(action, text="开始下载", style="Primary.TButton", command=self._start_download, state=tk.DISABLED)
-        self.start_button.grid(row=4, column=0, sticky=tk.EW)
+        self.start_button.grid(row=7, column=0, sticky=tk.EW)
         controls = ttk.Frame(action, style="Surface.TFrame")
-        controls.grid(row=5, column=0, sticky=tk.EW, pady=(4, 0))
+        controls.grid(row=8, column=0, sticky=tk.EW, pady=(4, 0))
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(2, weight=0)
@@ -334,7 +382,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         activity.grid(row=2, column=0, sticky=tk.NSEW, pady=(10, 0))
         progress_tab = ttk.Frame(activity, style="Surface.TFrame", padding=12)
         log_tab = ttk.Frame(activity, style="Surface.TFrame", padding=12)
+        format_tab = ttk.Frame(activity, style="Surface.TFrame", padding=12)
         activity.add(progress_tab, text="任务进度")
+        activity.add(format_tab, text="格式详情")
         activity.add(log_tab, text="活动日志")
 
         progress_tab.columnconfigure(0, weight=1)
@@ -350,6 +400,29 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.log_text = ScrolledText(log_tab, height=6, wrap=tk.WORD, borderwidth=0, font=("Cascadia Mono", 9))
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
         self.log_text.configure(bg="#F7F8FA", fg="#30343B", insertbackground="#30343B", relief=tk.FLAT, padx=10, pady=9)
+
+        format_tab.columnconfigure(0, weight=1)
+        format_tab.rowconfigure(0, weight=1)
+        format_columns = ("id", "resolution", "fps", "range", "video", "audio", "bitrate", "size", "protocol")
+        self.format_tree = ttk.Treeview(format_tab, columns=format_columns, show="headings", height=4)
+        format_headings = {
+            "id": ("ID", 55),
+            "resolution": ("分辨率", 90),
+            "fps": ("帧率", 55),
+            "range": ("动态范围", 75),
+            "video": ("视频编码", 115),
+            "audio": ("音频编码", 105),
+            "bitrate": ("码率", 75),
+            "size": ("大小", 75),
+            "protocol": ("协议", 90),
+        }
+        for key, (label, width) in format_headings.items():
+            self.format_tree.heading(key, text=label)
+            self.format_tree.column(key, width=width, minwidth=45, stretch=key in {"video", "audio"})
+        format_scroll = ttk.Scrollbar(format_tab, orient=tk.VERTICAL, command=self.format_tree.yview)
+        self.format_tree.configure(yscrollcommand=format_scroll.set)
+        self.format_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        format_scroll.grid(row=0, column=1, sticky=tk.NS)
 
     def _build_history_tab(self) -> None:
         tab = self.history_tab
@@ -447,77 +520,129 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.event_buffer.put("analysis_error", {"error": exc})
 
     def _start_download(self) -> None:
-        candidate = self._selected_candidate()
-        if not candidate:
-            self._show_notice("warning", "尚未选择媒体", "先解析链接，然后从列表中选择一个媒体版本。")
+        candidates = self._selected_candidates()
+        if not candidates:
+            self._show_notice("warning", "尚未选择媒体", "先解析链接，然后选择一个或多个媒体条目。")
             return
 
-        file_name = sanitize_file_name(self.file_name_var.get(), "video")
-        if not Path(file_name).suffix:
-            file_name += _default_suffix_for_candidate(candidate)
         output_dir = Path(self.output_dir_var.get()).expanduser()
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self._show_error(classify_error(exc))
             return
-        output_path = _available_output_path(output_dir / file_name)
-        if output_path.name != file_name:
-            self.file_name_var.set(output_path.name)
-            self._show_notice("info", "已避免覆盖现有文件", f"本次将保存为 {output_path.name}")
+        queue = _plan_output_paths(candidates, output_dir, self.file_name_var.get())
+        requested_name = sanitize_file_name(self.file_name_var.get(), "video")
+        if len(queue) == 1 and not Path(requested_name).suffix:
+            requested_name += _default_suffix_for_candidate(candidates[0])
+        if len(queue) == 1 and queue[0][1].name != requested_name:
+            self.file_name_var.set(queue[0][1].name)
+            self._show_notice("info", "已避免覆盖现有文件", f"本次将保存为 {queue[0][1].name}")
 
-        referer = self.referer_var.get().strip() or candidate.referer or candidate.source_url
-        headers = make_headers(referer)
         concurrency = max(1, min(32, int(self.concurrency_var.get())))
         keep_cache = self.keep_cache_var.get()
+        preferences = self._download_preferences()
+        referer_override = self.referer_var.get().strip()
 
-        self.current_candidate = candidate
-        self.current_record_id = uuid.uuid4().hex
-        self._create_history_record(candidate, output_path)
+        self.current_candidate = None
+        self.current_record_id = ""
+        self.current_job = None
+        self.queue_total = len(queue)
+        self.queue_completed = 0
+        self.queue_failed = 0
+        self.queue_stop_event.clear()
         self._reset_progress_estimator()
         self._set_downloading_state(True)
         self._draw_segments(0)
         self.progress.stop()
         self.progress.configure(mode="determinate", maximum=100, value=0)
         self.status_var.set("正在准备下载")
-        self.progress_detail_var.set("正在建立下载任务")
-        self._log(f"准备下载：{redact_url(candidate.url)}")
+        self.progress_detail_var.set(f"正在建立下载队列，共 {len(queue)} 项")
+        self._log(f"准备下载 {len(queue)} 个媒体条目")
 
         self.download_thread = threading.Thread(
             target=self._download_worker,
-            args=(candidate, output_path, headers, concurrency, keep_cache, referer),
+            args=(queue, concurrency, keep_cache, preferences, referer_override),
             daemon=True,
         )
         self.download_thread.start()
 
     def _download_worker(
         self,
-        candidate: VideoCandidate,
-        output_path: Path,
-        headers: dict[str, str],
+        queue: list[tuple[VideoCandidate, Path]],
         concurrency: int,
         keep_cache: bool,
-        referer: str,
+        preferences: DownloadPreferences,
+        referer_override: str,
     ) -> None:
-        try:
-            if candidate.source_type in {"youtube", "ytdlp"}:
-                job = YouTubeDownloadJob(candidate.url, output_path, concurrency=concurrency, referer=referer, callback=self._core_callback)
-            elif candidate.source_type == "direct":
-                job = DirectDownloadJob(candidate.url, output_path, headers=headers, callback=self._core_callback)
+        completed = 0
+        failed = 0
+        stopped = False
+        for index, (candidate, output_path) in enumerate(queue, start=1):
+            if self.queue_stop_event.is_set():
+                stopped = True
+                break
+            self.event_buffer.put(
+                "queue_item_started",
+                {"candidate": candidate, "output": str(output_path), "index": index, "total": len(queue)},
+            )
+            terminal: dict[str, object] = {}
+
+            def queue_callback(event: str, payload: dict) -> None:
+                if event in {"completed", "failed", "fatal", "stopped"}:
+                    terminal.update({"event": event, "payload": payload})
+                else:
+                    self._core_callback(event, payload)
+
+            try:
+                referer = referer_override or candidate.referer or candidate.source_url
+                headers = make_headers(referer)
+                if candidate.source_type in {"youtube", "ytdlp"}:
+                    job = YouTubeDownloadJob(
+                        candidate.url,
+                        output_path,
+                        concurrency=concurrency,
+                        referer=referer,
+                        callback=queue_callback,
+                        preferences=preferences,
+                    )
+                elif candidate.source_type == "direct":
+                    job = DirectDownloadJob(candidate.url, output_path, headers=headers, callback=queue_callback)
+                else:
+                    playlist = load_best_media_playlist(candidate.url, headers=headers)
+                    job = DownloadJob(
+                        playlist=playlist,
+                        output_path=output_path,
+                        headers=headers,
+                        concurrency=concurrency,
+                        keep_cache=keep_cache,
+                        callback=queue_callback,
+                    )
+                self.current_job = job
+                self.event_buffer.put("job_ready", {"job": job})
+                job.run()
+            except Exception as exc:
+                terminal.update({"event": "fatal", "payload": {"error": exc}})
+
+            terminal_event = str(terminal.get("event") or "fatal")
+            terminal_payload = terminal.get("payload") if isinstance(terminal.get("payload"), dict) else {}
+            if terminal_event == "completed":
+                completed += 1
+                output = str(terminal_payload.get("output") or output_path)
+                self.event_buffer.put("queue_item_completed", {"output": output, "index": index, "total": len(queue)})
+            elif terminal_event == "stopped":
+                stopped = True
+                self.event_buffer.put("queue_item_stopped", {"index": index, "total": len(queue)})
+                break
             else:
-                playlist = load_best_media_playlist(candidate.url, headers=headers)
-                job = DownloadJob(
-                    playlist=playlist,
-                    output_path=output_path,
-                    headers=headers,
-                    concurrency=concurrency,
-                    keep_cache=keep_cache,
-                    callback=self._core_callback,
-                )
-            self.event_buffer.put("job_ready", {"job": job})
-            job.run()
-        except Exception as exc:
-            self.event_buffer.put("fatal", {"error": exc})
+                failed += 1
+                error = terminal_payload.get("error") or terminal_payload.get("message") or "媒体下载未完成"
+                self.event_buffer.put("queue_item_failed", {"error": error, "index": index, "total": len(queue)})
+
+        self.event_buffer.put(
+            "queue_finished",
+            {"completed": completed, "failed": failed, "total": len(queue), "stopped": stopped},
+        )
 
     def _toggle_pause(self) -> None:
         if not self.current_job:
@@ -528,6 +653,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.current_job.resume()
 
     def _stop_download(self) -> None:
+        self.queue_stop_event.set()
         if self.current_job:
             self.current_job.stop()
 
@@ -544,17 +670,31 @@ class UniversalVideoDownloaderApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _selected_candidate(self) -> VideoCandidate | None:
+        candidates = self._selected_candidates()
+        return candidates[0] if candidates else None
+
+    def _selected_candidates(self) -> list[VideoCandidate]:
         selection = self.candidate_tree.selection()
         if not selection:
-            return None
-        try:
-            index = int(selection[0])
-        except (TypeError, ValueError):
-            return None
-        return self.candidates[index] if 0 <= index < len(self.candidates) else None
+            return []
+        indices: list[int] = []
+        for item in selection:
+            try:
+                index = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(self.candidates):
+                indices.append(index)
+        return [self.candidates[index] for index in sorted(indices)]
 
     def _select_best_candidate(self) -> None:
         if not self.candidates:
+            return
+        if self.candidates[0].playlist_count > 1:
+            items = tuple(str(index) for index in range(len(self.candidates)))
+            self.candidate_tree.selection_set(items)
+            self.candidate_tree.focus(items[0])
+            self._sync_selection()
             return
         best_index, _best = max(enumerate(self.candidates), key=lambda item: candidate_score(item[1]))
         iid = str(best_index)
@@ -564,14 +704,21 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._sync_selection()
 
     def _sync_selection(self) -> None:
-        candidate = self._selected_candidate()
-        if not candidate:
+        candidates = self._selected_candidates()
+        if not candidates:
             return
+        candidate = candidates[0]
         file_stem = sanitize_file_name(candidate.title.split(" / ", 1)[0], "video")
         self.file_name_var.set(file_stem + _default_suffix_for_candidate(candidate))
-        self.selection_var.set(_candidate_summary(candidate))
+        if len(candidates) > 1:
+            self.selection_var.set(f"已选择 {len(candidates)} 个条目 · 将按标题依次下载")
+            self.start_button.configure(text=f"下载选中项 ({len(candidates)})")
+        else:
+            self.selection_var.set(_candidate_summary(candidate))
+            self.start_button.configure(text="开始下载")
         if candidate.referer and not self.referer_var.get().strip():
             self.referer_var.set(candidate.referer)
+        self._refresh_format_details(candidates)
         if candidate.source_type == "hls":
             self.task_controls.columnconfigure(2, weight=1)
             self.partial_button.grid()
@@ -579,11 +726,77 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.partial_button.grid_remove()
             self.task_controls.columnconfigure(2, weight=0)
 
+    def _refresh_format_details(self, candidates: list[VideoCandidate]) -> None:
+        for item in self.format_tree.get_children():
+            self.format_tree.delete(item)
+        candidate = candidates[0]
+        for index, media_format in enumerate(candidate.formats):
+            self.format_tree.insert(
+                "",
+                tk.END,
+                iid=f"format-{index}",
+                values=(
+                    media_format.format_id or "-",
+                    media_format.resolution or "仅音频",
+                    f"{media_format.fps:g}" if media_format.fps else "-",
+                    media_format.dynamic_range or "SDR",
+                    media_format.vcodec or "-",
+                    media_format.acodec or "-",
+                    f"{media_format.tbr:.0f} kbps" if media_format.tbr else "-",
+                    _format_size(media_format.filesize) if media_format.filesize else "-",
+                    media_format.protocol or "-",
+                ),
+            )
+
+        self.subtitle_choices = _subtitle_choice_map(candidates)
+        subtitle_values = ["不下载字幕", "全部可用", *self.subtitle_choices] if self.subtitle_choices else ["不下载字幕"]
+        self.subtitle_combo.configure(values=subtitle_values)
+        if self.subtitle_var.get() not in subtitle_values:
+            self.subtitle_var.set("不下载字幕")
+        subtitle_state = tk.NORMAL if self.subtitle_choices else tk.DISABLED
+        self.auto_subtitle_check.configure(state=subtitle_state)
+
+    def _on_subtitle_selected(self) -> None:
+        _language, automatic_only = self.subtitle_choices.get(self.subtitle_var.get(), ("", False))
+        if automatic_only:
+            self.auto_subtitle_var.set(True)
+
+    def _download_preferences(self) -> DownloadPreferences:
+        quality = {
+            "最佳质量": "best",
+            "最高 1080p": "1080p",
+            "最高 720p": "720p",
+            "较小文件": "compact",
+        }.get(self.quality_var.get(), "best")
+        subtitle = self.subtitle_var.get()
+        languages: tuple[str, ...] = ()
+        if subtitle == "全部可用":
+            languages = ("all",)
+        elif subtitle and subtitle != "不下载字幕":
+            language, automatic_only = self.subtitle_choices.get(subtitle, (subtitle, False))
+            languages = (language,)
+            if automatic_only:
+                self.auto_subtitle_var.set(True)
+        return DownloadPreferences(
+            quality=quality,
+            subtitle_languages=languages,
+            include_auto_subtitles=self.auto_subtitle_var.get(),
+            subtitle_format=self.subtitle_format_var.get() or "srt",
+            embed_subtitles=self.embed_subtitle_var.get() and ffmpeg_capability().available,
+        )
+
     def _clear_candidates(self) -> None:
         self.candidates = []
         self.selection_var.set("正在查找可下载媒体")
         for item in self.candidate_tree.get_children():
             self.candidate_tree.delete(item)
+        if hasattr(self, "format_tree"):
+            for item in self.format_tree.get_children():
+                self.format_tree.delete(item)
+        self.subtitle_combo.configure(values=("不下载字幕",))
+        self.subtitle_choices = {}
+        self.subtitle_var.set("不下载字幕")
+        self.start_button.configure(text="开始下载")
         self.best_button.configure(state=tk.DISABLED)
         self.start_button.configure(state=tk.DISABLED)
 
@@ -620,6 +833,48 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._show_error(classify_error(payload.get("error", "解析失败")))
         elif event == "job_ready":
             self.current_job = payload["job"]
+        elif event == "queue_item_started":
+            candidate = payload["candidate"]
+            output_path = Path(payload["output"])
+            self.current_candidate = candidate
+            self.current_record_id = uuid.uuid4().hex
+            self._reset_progress_estimator()
+            self._create_history_record(candidate, output_path)
+            index = int(payload.get("index", 1))
+            total = int(payload.get("total", 1))
+            self.status_var.set(f"正在下载 {index}/{total}")
+            self.progress_detail_var.set(f"队列 {index}/{total} · 正在准备 {output_path.name}")
+            self._log(f"队列 {index}/{total}：{redact_url(candidate.url)}")
+        elif event == "queue_item_completed":
+            self.queue_completed += 1
+            self.progress["value"] = 100
+            self._history_update(status="completed", progress=100.0, force=True)
+            output = Path(str(payload.get("output", "")))
+            self._log("已完成：" + output.name)
+        elif event == "queue_item_failed":
+            self.queue_failed += 1
+            error = classify_error(payload.get("error", "媒体下载未完成"))
+            self._history_update(status="failed", error=error, force=True)
+            self._log(f"下载失败：{error.message}", "error")
+        elif event == "queue_item_stopped":
+            self._history_update(status="stopped", force=True)
+            self._log("当前条目已停止，剩余队列不再启动。")
+        elif event == "queue_finished":
+            self._set_downloading_state(False)
+            self.current_job = None
+            completed = int(payload.get("completed", 0))
+            failed = int(payload.get("failed", 0))
+            total = int(payload.get("total", 0))
+            if payload.get("stopped"):
+                self.status_var.set("下载队列已停止")
+                self._show_notice("info", "队列已停止", f"已完成 {completed}/{total} 项，已下载数据和续传缓存均已保留。")
+            elif failed:
+                self.status_var.set("下载队列已完成，部分项目需重试")
+                self._show_notice("warning", "队列已完成", f"成功 {completed} 项，失败 {failed} 项；可从任务记录重新填入失败链接。")
+            else:
+                self.status_var.set("下载队列已完成")
+                self.progress_detail_var.set(f"已完成 {completed}/{total} 项")
+                self._show_notice("success", "下载完成", f"队列中的 {completed} 个媒体文件已写入保存目录。")
         elif event == "started":
             self._draw_segments(int(payload.get("total", 0)))
             self._history_update(status="downloading", force=True)
@@ -688,19 +943,26 @@ class UniversalVideoDownloaderApp(tk.Tk):
                 tk.END,
                 iid=str(index),
                 values=(
+                    candidate.title.split(" / ", 1)[0],
                     candidate.resolution or "自动",
                     _candidate_format_label(candidate),
-                    _candidate_engine_label(candidate),
                     _format_duration(candidate.duration),
-                    f"{round(candidate.bandwidth / 1000)} kbps" if candidate.bandwidth else "-",
                     _candidate_origin_label(candidate),
                 ),
             )
-        self.best_button.configure(state=tk.NORMAL)
+        is_playlist = bool(candidates and candidates[0].playlist_count > 1)
+        self.best_button.configure(state=tk.NORMAL, text="全选列表" if is_playlist else "选择推荐项")
         self.start_button.configure(state=tk.NORMAL)
-        self._select_best_candidate()
-        self._log(f"发现 {len(candidates)} 个可下载媒体，已选择推荐项。")
-        self._show_notice("success", "解析完成", f"找到 {len(candidates)} 个媒体版本，已按画质与码率排序。")
+        if is_playlist:
+            self.candidate_tree.selection_set("0")
+            self.candidate_tree.focus("0")
+            self._sync_selection()
+            self._log(f"发现播放列表中的 {len(candidates)} 个媒体条目，默认选择第一项。")
+            self._show_notice("success", "播放列表解析完成", f"找到 {len(candidates)} 个条目，可多选或点击“全选列表”加入下载队列。")
+        else:
+            self._select_best_candidate()
+            self._log(f"发现 {len(candidates)} 个可下载媒体，已选择推荐项。")
+            self._show_notice("success", "解析完成", f"找到 {len(candidates)} 个媒体版本，已按画质与码率排序。")
 
     def _reset_progress_estimator(self) -> None:
         self.last_progress_bytes = 0
@@ -938,6 +1200,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _on_close(self) -> None:
         if self.is_downloading and not messagebox.askyesno("退出下载器", "当前任务仍在下载。退出后可依靠缓存继续，确定退出吗？"):
             return
+        self.queue_stop_event.set()
         if self.current_job:
             self.current_job.stop()
         self.destroy()
@@ -1038,6 +1301,20 @@ def _candidate_summary(candidate: VideoCandidate) -> str:
     return " · ".join(parts)
 
 
+def _subtitle_choice_map(candidates: list[VideoCandidate]) -> dict[str, tuple[str, bool]]:
+    availability: dict[str, set[bool]] = {}
+    for candidate in candidates:
+        for track in candidate.subtitles:
+            if track.language:
+                availability.setdefault(track.language, set()).add(track.automatic)
+    choices: dict[str, tuple[str, bool]] = {}
+    for language in sorted(availability):
+        automatic_only = availability[language] == {True}
+        label = f"{language}（自动）" if automatic_only else language
+        choices[label] = (language, automatic_only)
+    return choices
+
+
 def _history_status_label(status: str) -> str:
     return {
         "preparing": "准备中",
@@ -1062,6 +1339,32 @@ def _available_output_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     return path.with_name(f"{path.stem}-{int(time.time())}{path.suffix}")
+
+
+def _plan_output_paths(
+    candidates: list[VideoCandidate],
+    output_dir: Path,
+    requested_file_name: str,
+) -> list[tuple[VideoCandidate, Path]]:
+    reserved: set[Path] = set()
+    result: list[tuple[VideoCandidate, Path]] = []
+    for candidate in candidates:
+        if len(candidates) == 1:
+            file_name = sanitize_file_name(requested_file_name, "video")
+        else:
+            file_name = sanitize_file_name(candidate.title.split(" / ", 1)[0], "video")
+        if not Path(file_name).suffix:
+            file_name += _default_suffix_for_candidate(candidate)
+        path = output_dir / file_name
+        if path.exists() or path in reserved:
+            for index in range(1, 1000):
+                alternative = path.with_name(f"{path.stem} ({index}){path.suffix}")
+                if not alternative.exists() and alternative not in reserved:
+                    path = alternative
+                    break
+        reserved.add(path)
+        result.append((candidate, path))
+    return result
 
 
 def _resource_path(relative_path: str) -> Path:

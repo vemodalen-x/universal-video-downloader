@@ -1,15 +1,20 @@
 from pathlib import Path
 import struct
+import threading
 import zlib
 
-from m3u8_core import VideoCandidate
+import m3u8_desktop_app
+from m3u8_core import CoalescingEventBuffer, DownloadPreferences, SubtitleTrack, VideoCandidate
 from m3u8_desktop_app import (
     MAX_SEGMENT_BLOCKS,
     UI_REFRESH_INTERVAL_MS,
+    UniversalVideoDownloaderApp,
     _available_output_path,
     _candidate_format_label,
     _candidate_summary,
     _history_status_label,
+    _plan_output_paths,
+    _subtitle_choice_map,
 )
 
 
@@ -44,6 +49,90 @@ def test_candidate_presentation_uses_human_labels() -> None:
     assert "1920x1080" in _candidate_summary(candidate)
     assert "42 个分片" in _candidate_summary(candidate)
     assert _history_status_label("interrupted") == "已中断"
+
+
+def test_batch_output_paths_use_titles_and_reserve_duplicate_names(tmp_path) -> None:
+    first = VideoCandidate(
+        title="Episode / 网页",
+        url="https://example.com/one",
+        source_url="https://example.com/playlist",
+        source_type="ytdlp",
+    )
+    second = VideoCandidate(
+        title="Episode / 网页",
+        url="https://example.com/two",
+        source_url="https://example.com/playlist",
+        source_type="ytdlp",
+    )
+    (tmp_path / "Episode.mp4").write_bytes(b"existing")
+
+    planned = _plan_output_paths([first, second], tmp_path, "ignored.mp4")
+
+    assert [path.name for _candidate, path in planned] == ["Episode (1).mp4", "Episode (2).mp4"]
+
+
+def test_download_queue_continues_after_an_item_fails(monkeypatch, tmp_path) -> None:
+    run_order: list[str] = []
+
+    class FakeJob:
+        def __init__(self, url: str, output_path: Path, callback, **_kwargs) -> None:
+            self.url = url
+            self.output_path = output_path
+            self.callback = callback
+
+        def run(self) -> None:
+            run_order.append(self.url)
+            if self.url.endswith("one"):
+                self.callback("fatal", {"message": "synthetic failure"})
+            else:
+                self.callback("completed", {"output": str(self.output_path)})
+
+        def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(m3u8_desktop_app, "YouTubeDownloadJob", FakeJob)
+    app = object.__new__(UniversalVideoDownloaderApp)
+    app.event_buffer = CoalescingEventBuffer()
+    app.queue_stop_event = threading.Event()
+    app.current_job = None
+    first = VideoCandidate("One", "https://example.com/one", "https://example.com/list", source_type="ytdlp")
+    second = VideoCandidate("Two", "https://example.com/two", "https://example.com/list", source_type="ytdlp")
+
+    app._download_worker(
+        [(first, tmp_path / "one.mp4"), (second, tmp_path / "two.mp4")],
+        concurrency=4,
+        keep_cache=True,
+        preferences=DownloadPreferences(),
+        referer_override="",
+    )
+
+    events = app.event_buffer.drain()
+    assert run_order == ["https://example.com/one", "https://example.com/two"]
+    assert [event for event, _payload in events].count("queue_item_failed") == 1
+    assert [event for event, _payload in events].count("queue_item_completed") == 1
+    assert events[-1] == ("queue_finished", {"completed": 1, "failed": 1, "total": 2, "stopped": False})
+
+
+def test_subtitle_choices_mark_automatic_only_languages() -> None:
+    candidate = VideoCandidate(
+        title="Video",
+        url="https://example.com/video",
+        source_url="https://example.com/video",
+        subtitles=(
+            SubtitleTrack("zh-Hans", automatic=False),
+            SubtitleTrack("en", automatic=True),
+            SubtitleTrack("ja", automatic=False),
+            SubtitleTrack("ja", automatic=True),
+        ),
+    )
+
+    choices = _subtitle_choice_map([candidate])
+
+    assert choices == {
+        "en（自动）": ("en", True),
+        "ja": ("ja", False),
+        "zh-Hans": ("zh-Hans", False),
+    }
 
 
 def test_v2_brand_assets_cover_windows_icon_sizes() -> None:

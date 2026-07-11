@@ -110,6 +110,52 @@ class VideoCandidate:
     source_type: str = "hls"
     container: str = ""
     extractor: str = ""
+    formats: tuple[MediaFormat, ...] = ()
+    subtitles: tuple[SubtitleTrack, ...] = ()
+    playlist_index: int = 0
+    playlist_count: int = 0
+    playlist_title: str = ""
+
+
+@dataclass(frozen=True)
+class MediaFormat:
+    format_id: str
+    ext: str = ""
+    resolution: str = ""
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    dynamic_range: str = ""
+    vcodec: str = ""
+    acodec: str = ""
+    tbr: float = 0.0
+    filesize: int = 0
+    protocol: str = ""
+    has_video: bool = False
+    has_audio: bool = False
+
+
+@dataclass(frozen=True)
+class SubtitleTrack:
+    language: str
+    name: str = ""
+    automatic: bool = False
+    formats: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DownloadPreferences:
+    quality: str = "best"
+    subtitle_languages: tuple[str, ...] = ()
+    include_auto_subtitles: bool = False
+    subtitle_format: str = "srt"
+    embed_subtitles: bool = False
+
+
+@dataclass(frozen=True)
+class FFmpegCapability:
+    available: bool
+    path: str = ""
 
 
 @dataclass
@@ -721,7 +767,8 @@ def _discover_ytdlp_candidates(
             "skip_download": True,
             "quiet": True,
             "no_warnings": True,
-            "noplaylist": True,
+            "noplaylist": False,
+            "playlistend": 50,
         }
     )
     try:
@@ -732,38 +779,118 @@ def _discover_ytdlp_candidates(
 
     if not isinstance(info, dict):
         raise HlsError("通用解析器没有返回可下载的视频信息")
-    if info.get("_type") == "playlist" and info.get("entries"):
-        first = next((item for item in info.get("entries") or [] if item), None)
-        if isinstance(first, dict):
-            info = first
+    raw_entries = info.get("entries")
+    entries = raw_entries if isinstance(raw_entries, list) else None
+    playlist_entries = [item for item in entries or [] if isinstance(item, dict)] if entries is not None else [info]
+    playlist_entries = playlist_entries[:50]
+    if not playlist_entries:
+        raise HlsError("播放列表中没有可下载的视频")
 
-    title = sanitize_file_name(str(info.get("title") or info.get("id") or "youtube-video"), "youtube-video")
-    resolution = _youtube_resolution(info)
-    bandwidth = _youtube_bandwidth(info)
-    duration = float(info.get("duration") or 0.0)
-    extractor = str(info.get("extractor_key") or info.get("extractor") or "yt-dlp")
-    display_title = title
-    if resolution:
-        display_title = f"{display_title} / {label} / {resolution}"
-    else:
-        display_title = f"{display_title} / {label}"
-
+    playlist_title = str(info.get("title") or "") if entries is not None else ""
+    playlist_count = len(playlist_entries) if entries is not None else 0
     return [
-        VideoCandidate(
-            title=display_title,
-            url=source_url,
+        _candidate_from_ytdlp_info(
+            item,
             source_url=source_url,
-            referer=_default_referer(source_url),
-            bandwidth=bandwidth,
-            resolution=resolution,
-            segment_count=100,
-            duration=duration,
-            encrypted=False,
             source_type=source_type,
-            container=str(info.get("ext") or "mp4"),
-            extractor=extractor,
+            label=label,
+            playlist_index=index if playlist_count else 0,
+            playlist_count=playlist_count,
+            playlist_title=playlist_title,
         )
+        for index, item in enumerate(playlist_entries, start=1)
     ]
+
+
+def _candidate_from_ytdlp_info(
+    info: dict,
+    source_url: str,
+    source_type: str,
+    label: str,
+    playlist_index: int = 0,
+    playlist_count: int = 0,
+    playlist_title: str = "",
+) -> VideoCandidate:
+    title = sanitize_file_name(str(info.get("title") or info.get("id") or "video"), "video")
+    resolution = _youtube_resolution(info)
+    display_title = f"{title} / {label}"
+    if playlist_index:
+        display_title = f"{playlist_index:02d}. {display_title}"
+    if resolution:
+        display_title = f"{display_title} / {resolution}"
+
+    media_url = str(info.get("webpage_url") or info.get("original_url") or info.get("url") or source_url)
+    return VideoCandidate(
+        title=display_title,
+        url=media_url,
+        source_url=source_url,
+        referer=_default_referer(source_url),
+        bandwidth=_youtube_bandwidth(info),
+        resolution=resolution,
+        segment_count=100,
+        duration=_safe_float(info.get("duration")),
+        encrypted=False,
+        source_type=source_type,
+        container=str(info.get("ext") or "mp4"),
+        extractor=str(info.get("extractor_key") or info.get("extractor") or "yt-dlp"),
+        formats=_normalize_ytdlp_formats(info.get("formats")),
+        subtitles=_normalize_ytdlp_subtitles(info),
+        playlist_index=playlist_index,
+        playlist_count=playlist_count,
+        playlist_title=playlist_title,
+    )
+
+
+def _normalize_ytdlp_formats(raw_formats: object) -> tuple[MediaFormat, ...]:
+    if not isinstance(raw_formats, list):
+        return ()
+    formats: list[MediaFormat] = []
+    for item in raw_formats:
+        if not isinstance(item, dict):
+            continue
+        width = _safe_int(str(item.get("width") or 0))
+        height = _safe_int(str(item.get("height") or 0))
+        resolution = str(item.get("resolution") or "")
+        if not resolution and height:
+            resolution = f"{width}x{height}" if width else f"{height}p"
+        vcodec = str(item.get("vcodec") or "")
+        acodec = str(item.get("acodec") or "")
+        formats.append(
+            MediaFormat(
+                format_id=str(item.get("format_id") or ""),
+                ext=str(item.get("ext") or ""),
+                resolution=resolution,
+                width=width,
+                height=height,
+                fps=_safe_float(item.get("fps")),
+                dynamic_range=str(item.get("dynamic_range") or ""),
+                vcodec=vcodec,
+                acodec=acodec,
+                tbr=_safe_float(item.get("tbr") or item.get("vbr") or item.get("abr")),
+                filesize=_safe_int(str(item.get("filesize") or item.get("filesize_approx") or 0)),
+                protocol=str(item.get("protocol") or ""),
+                has_video=bool(vcodec and vcodec != "none"),
+                has_audio=bool(acodec and acodec != "none"),
+            )
+        )
+    return tuple(formats)
+
+
+def _normalize_ytdlp_subtitles(info: dict) -> tuple[SubtitleTrack, ...]:
+    tracks: list[SubtitleTrack] = []
+    for automatic, key in ((False, "subtitles"), (True, "automatic_captions")):
+        source = info.get(key)
+        if not isinstance(source, dict):
+            continue
+        for language, entries in source.items():
+            if not isinstance(entries, list):
+                continue
+            formats = tuple(
+                _dedupe(str(item.get("ext") or "") for item in entries if isinstance(item, dict) and item.get("ext"))
+            )
+            name = next((str(item.get("name") or "") for item in entries if isinstance(item, dict) and item.get("name")), "")
+            tracks.append(SubtitleTrack(language=str(language), name=name, automatic=automatic, formats=formats))
+    return tuple(tracks)
 
 
 def find_m3u8_urls(base_url: str, text: str) -> list[str]:
@@ -1183,12 +1310,14 @@ class YouTubeDownloadJob:
         concurrency: int = 4,
         referer: str = "",
         callback: Optional[EventCallback] = None,
+        preferences: Optional[DownloadPreferences] = None,
     ) -> None:
         self.url = url
         self.output_path = output_path
         self.concurrency = max(1, min(16, concurrency))
         self.referer = referer
         self.callback = callback
+        self.preferences = preferences or DownloadPreferences()
         self.pause_event = threading.Event()
         self.pause_event.set()
         self.stop_event = threading.Event()
@@ -1230,7 +1359,12 @@ class YouTubeDownloadJob:
             )
             self._emit_progress(done=0, downloading=1, bytes_done=0)
 
-            options = _ytdlp_base_options(self.url, self.referer)
+            capability = ffmpeg_capability()
+            options = build_ytdlp_options(self.url, self.referer, self.preferences, capability.available)
+            if capability.available:
+                _emit(self.callback, "log", level="info", message=f"FFmpeg 已就绪：{capability.path}")
+            elif self.preferences.embed_subtitles:
+                _emit(self.callback, "log", level="warning", message="未检测到 FFmpeg，字幕将单独保存，无法嵌入视频。")
             if _looks_like_youtube_url(self.url):
                 options["extractor_args"] = {"youtube": {"player_client": ["default", "ios"]}}
             options.update(
@@ -1662,18 +1796,61 @@ def _has_specific_ytdlp_extractor(source_url: str) -> bool:
     return False
 
 
-def _ytdlp_base_options(source_url: str, referer: str = "") -> dict:
+@lru_cache(maxsize=1)
+def ffmpeg_capability() -> FFmpegCapability:
+    path = shutil.which("ffmpeg") or ""
+    return FFmpegCapability(available=bool(path), path=path)
+
+
+def build_ytdlp_options(
+    source_url: str,
+    referer: str = "",
+    preferences: Optional[DownloadPreferences] = None,
+    ffmpeg_available: Optional[bool] = None,
+) -> dict:
+    preferences = preferences or DownloadPreferences()
+    has_ffmpeg = ffmpeg_capability().available if ffmpeg_available is None else ffmpeg_available
     options = {
-        "format": _youtube_format_selector(),
+        "format": _quality_format_selector(preferences.quality, has_ffmpeg),
         "http_headers": make_headers(referer or _default_referer(source_url)),
         "socket_timeout": 15,
         "retries": 2,
         "extractor_retries": 2,
         "fragment_retries": 3,
     }
-    if shutil.which("ffmpeg"):
+    if preferences.quality == "compact":
+        options["format_sort"] = ["+size", "+br", "+res", "+fps"]
+    if has_ffmpeg:
         options["merge_output_format"] = "mp4"
+
+    languages = tuple(language for language in preferences.subtitle_languages if language)
+    if languages:
+        options.update(
+            {
+                "writesubtitles": True,
+                "writeautomaticsub": preferences.include_auto_subtitles,
+                "subtitleslangs": list(languages),
+                "subtitlesformat": f"{preferences.subtitle_format}/best",
+            }
+        )
+        postprocessors: list[dict] = []
+        if has_ffmpeg and preferences.subtitle_format in {"srt", "vtt", "ass", "lrc"}:
+            postprocessors.append(
+                {
+                    "key": "FFmpegSubtitlesConvertor",
+                    "format": preferences.subtitle_format,
+                    "when": "before_dl",
+                }
+            )
+        if has_ffmpeg and preferences.embed_subtitles:
+            postprocessors.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
+        if postprocessors:
+            options["postprocessors"] = postprocessors
     return options
+
+
+def _ytdlp_base_options(source_url: str, referer: str = "") -> dict:
+    return build_ytdlp_options(source_url, referer)
 
 
 def _youtube_base_options() -> dict:
@@ -1683,8 +1860,17 @@ def _youtube_base_options() -> dict:
 
 
 def _youtube_format_selector() -> str:
-    if shutil.which("ffmpeg"):
-        return "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+    return _quality_format_selector("best", ffmpeg_capability().available)
+
+
+def _quality_format_selector(quality: str, has_ffmpeg: bool) -> str:
+    max_height = {"1080p": 1080, "720p": 720}.get(quality)
+    if has_ffmpeg:
+        if max_height:
+            return f"bv*[height<=?{max_height}]+ba/b[height<=?{max_height}]/b"
+        return "bv*+ba/b"
+    if max_height:
+        return f"b[height<=?{max_height}][ext=mp4]/b[height<=?{max_height}]/best[ext=mp4]/best"
     return "best[ext=mp4]/best"
 
 
@@ -1786,6 +1972,13 @@ def _safe_int(value: str) -> int:
         return int(float(value.strip()))
     except (TypeError, ValueError):
         return 0
+
+
+def _safe_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _default_referer(url: str) -> str:
