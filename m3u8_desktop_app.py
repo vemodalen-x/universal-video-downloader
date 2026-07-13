@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ import tkinter as tk
 from tkinter import ttk
 from urllib.parse import urlparse
 
+from browser_companion import BrowserCompanionError, BrowserInbox
 from m3u8_core import (
     CoalescingEventBuffer,
     DirectDownloadJob,
@@ -40,6 +42,7 @@ from m3u8_core import (
 APP_NAME = "Universal Video Downloader"
 APP_TITLE = "通用视频下载器"
 UI_REFRESH_INTERVAL_MS = 100
+BROWSER_INBOX_INTERVAL_MS = 1000
 MAX_SEGMENT_BLOCKS = 160
 
 
@@ -54,6 +57,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._apply_window_icon()
 
         self.event_buffer = CoalescingEventBuffer()
+        self.browser_inbox = BrowserInbox()
         self.candidates: list[VideoCandidate] = []
         self.current_job: DirectDownloadJob | DownloadJob | YouTubeDownloadJob | None = None
         self.current_candidate: VideoCandidate | None = None
@@ -65,6 +69,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.queue_failed = 0
         self.subtitle_choices: dict[str, tuple[str, bool]] = {}
         self.is_downloading = False
+        self.is_analyzing = False
         self.advanced_visible = False
 
         self.history_store = DownloadHistoryStore(default_history_path())
@@ -105,6 +110,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._refresh_history()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(UI_REFRESH_INTERVAL_MS, self._drain_events)
+        self.after(BROWSER_INBOX_INTERVAL_MS, self._poll_browser_inbox)
 
     def _load_history(self) -> list[DownloadRecord]:
         records = self.history_store.load()
@@ -236,8 +242,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
         title_row.grid(row=0, column=0, columnspan=4, sticky=tk.EW)
         title_row.columnconfigure(0, weight=1)
         ttk.Label(title_row, text="添加媒体链接", style="Section.TLabel").grid(row=0, column=0, sticky=tk.W)
+        self.companion_button = ttk.Button(
+            title_row,
+            text="连接浏览器",
+            style="Link.TButton",
+            command=self._start_browser_companion_setup,
+        )
+        self.companion_button.grid(row=0, column=1, sticky=tk.E, padx=(0, 14))
         self.advanced_button = ttk.Button(title_row, text="显示高级选项", style="Link.TButton", command=self._toggle_advanced)
-        self.advanced_button.grid(row=0, column=1, sticky=tk.E)
+        self.advanced_button.grid(row=0, column=2, sticky=tk.E)
 
         self.url_entry = ttk.Entry(source, textvariable=self.url_var)
         self.url_entry.grid(row=1, column=0, sticky=tk.EW, pady=(12, 0), padx=(0, 8))
@@ -801,8 +814,76 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.start_button.configure(state=tk.DISABLED)
 
     def _set_busy_analyzing(self, busy: bool) -> None:
+        self.is_analyzing = busy
         self.analyze_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         self.status_var.set("正在解析媒体" if busy else "等待开始下载")
+
+    def _poll_browser_inbox(self) -> None:
+        try:
+            if not self.is_downloading and not self.is_analyzing:
+                candidate = self.browser_inbox.pop()
+                if candidate:
+                    self.main_notebook.select(self.download_tab)
+                    self.url_var.set(candidate.url)
+                    self.referer_var.set(candidate.source_page)
+                    self.status_var.set("已收到浏览器媒体")
+                    self._log(f"浏览器伴侣已发送 {candidate.kind.upper()} 媒体：{redact_url(candidate.url)}")
+                    self._show_notice("info", "已收到浏览器媒体", "正在使用当前页面作为 Referer 并自动解析媒体。")
+                    self.after(80, self._start_analyze)
+        except BrowserCompanionError as exc:
+            self._log(f"浏览器伴侣收件箱已重置：{exc}", "warning")
+            try:
+                self.browser_inbox.clear()
+            except BrowserCompanionError:
+                pass
+        finally:
+            self.after(BROWSER_INBOX_INTERVAL_MS, self._poll_browser_inbox)
+
+    def _start_browser_companion_setup(self) -> None:
+        installer, bridge, extension = _browser_companion_package_paths()
+        if not installer.is_file() or not bridge.is_file() or not extension.is_dir():
+            self._show_notice("warning", "浏览器组件不完整", "请使用正式便携包中的桌面程序启动此功能。")
+            return
+        approved = messagebox.askyesno(
+            "连接浏览器",
+            "将为当前 Windows 用户注册本地浏览器桥接，并打开扩展目录。是否继续？",
+            parent=self,
+        )
+        if not approved:
+            return
+        self.companion_button.configure(state=tk.DISABLED)
+        self.status_var.set("正在注册浏览器伴侣")
+        threading.Thread(
+            target=self._browser_companion_setup_worker,
+            args=(installer, _browser_companion_installed_extension_path()),
+            daemon=True,
+        ).start()
+
+    def _browser_companion_setup_worker(self, installer: Path, extension: Path) -> None:
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                ],
+                cwd=installer.parent,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "注册脚本执行失败").strip().splitlines()[-1]
+                raise OSError(detail)
+            self.event_buffer.put("browser_companion_installed", {"extension": str(extension)})
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.event_buffer.put("browser_companion_install_error", {"error": str(exc)})
 
     def _set_downloading_state(self, active: bool) -> None:
         self.is_downloading = active
@@ -831,6 +912,21 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.progress.configure(mode="determinate", value=0)
             self._set_busy_analyzing(False)
             self._show_error(classify_error(payload.get("error", "解析失败")))
+        elif event == "browser_companion_installed":
+            self.companion_button.configure(state=tk.NORMAL)
+            extension = Path(str(payload.get("extension", "")))
+            try:
+                if extension.is_dir():
+                    os.startfile(extension)
+                _open_browser_extensions_page()
+            except OSError as exc:
+                self._log(f"浏览器扩展目录未能自动打开：{exc}", "warning")
+            self.status_var.set("浏览器伴侣已注册")
+            self._show_notice("success", "浏览器伴侣已注册", "扩展目录和浏览器扩展管理页已打开。")
+        elif event == "browser_companion_install_error":
+            self.companion_button.configure(state=tk.NORMAL)
+            self.status_var.set("浏览器伴侣注册失败")
+            self._show_notice("warning", "浏览器伴侣注册失败", str(payload.get("error", "请检查便携包是否完整。")))
         elif event == "job_ready":
             self.current_job = payload["job"]
         elif event == "queue_item_started":
@@ -1370,6 +1466,32 @@ def _plan_output_paths(
 def _resource_path(relative_path: str) -> Path:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base_path / relative_path
+
+
+def _browser_companion_package_paths(base_path: Path | None = None) -> tuple[Path, Path, Path]:
+    root = base_path
+    if root is None:
+        root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return (
+        root / "install_browser_companion.ps1",
+        root / "UniversalVideoDownloaderBridge.exe",
+        root / "browser-extension",
+    )
+
+
+def _browser_companion_installed_extension_path(local_app_data: Path | None = None) -> Path:
+    root = local_app_data or Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    return root / "UniversalVideoDownloader" / "browser-companion" / "extension"
+
+
+def _open_browser_extensions_page() -> bool:
+    roots = [Path(value) for name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA") if (value := os.environ.get(name))]
+    candidates = [root / relative for root in roots for relative in ("Google/Chrome/Application/chrome.exe", "Microsoft/Edge/Application/msedge.exe")]
+    for executable in candidates:
+        if executable.is_file():
+            subprocess.Popen([str(executable), "chrome://extensions/"])
+            return True
+    return False
 
 
 if __name__ == "__main__":

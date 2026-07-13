@@ -13,6 +13,7 @@
 - 静态扫描没有结果时，自动切换到 `yt-dlp` 通用网页解析器。
 - 自动识别普通视频直链，例如 `.mp4`、`.webm`、`.mov`、`.mkv`、`.m4v`。
 - 使用 `yt-dlp` 支持 YouTube 视频解析、下载和音视频合并。
+- 提供 Chrome/Edge 浏览器伴侣：用户主动点击后检测当前标签页已经加载的公开 HLS、DASH 和视频直链，并发送到桌面端解析。
 - 支持 yt-dlp 播放列表展开、多选和顺序批量下载，单个失败不会中断剩余队列。
 - 提供最佳质量、最高 1080p、最高 720p 和较小文件四种下载策略。
 - 解析并展示可用格式的分辨率、帧率、HDR、音视频编码、码率、大小和协议。
@@ -38,6 +39,7 @@
 | 普通视频直链 | 支持 | 支持 mp4、webm、mov、mkv、m4v 等常见扩展 |
 | YouTube | 支持 | 通过 yt-dlp 解析，通常需要 ffmpeg 合并音视频 |
 | 通用网页媒体 | 支持 | 静态扫描失败后通过 yt-dlp 的站点提取器尝试解析 |
+| 浏览器当前页检测 | 实验性支持 | Chrome/Edge 主动检测，不读取 Cookie，不常驻监听浏览历史 |
 | DASH / MPD | 部分支持 | yt-dlp 能识别的公开资源可下载，尚无原生 MPD 解析器 |
 | DRM 内容 | 不支持 | 不绕过 Widevine、FairPlay、PlayReady 等 DRM |
 
@@ -66,6 +68,19 @@ python m3u8_desktop_app.py
 6. 需要手动设置 `Referer`、并发数或缓存策略时，展开“高级选项”。
 7. 中断后再次使用相同来源和输出路径开始下载，会复用分片缓存、`.part` 文件或 yt-dlp 临时文件继续下载。
 
+## 浏览器伴侣
+
+浏览器伴侣用于补充动态页面发现能力。扩展只有 `activeTab`、`scripting` 和 `nativeMessaging` 权限；只有用户点击“检测当前页面”时，才会读取当前标签页 DOM 与 Resource Timing 中已经加载的公开媒体地址。
+
+正式便携包中的安装步骤：
+
+1. 在桌面端点击“连接浏览器”并确认；也可手动运行 `install_browser_companion.ps1`。
+2. 打开 `chrome://extensions` 或 `edge://extensions`，开启“开发者模式”。
+3. 点击“加载已解压的扩展程序”，选择安装脚本输出的扩展目录。
+4. 在视频页面先播放几秒，点击扩展图标和“检测当前页面”，再把候选发送到桌面端。
+
+浏览器发送的媒体地址会进入最多 20 条、15 分钟过期的本地收件箱。收件箱使用 AES-GCM 加密；Windows 上密钥由当前用户 DPAPI 保护。扩展不会接收或发送 Cookie、Authorization、账号密码和浏览器历史。
+
 ## 本地数据与隐私
 
 任务记录默认保存在：
@@ -79,7 +94,9 @@ python m3u8_desktop_app.py
 ## 当前限制
 
 - 工具不会导入浏览器 Cookie、登录会话或受保护的用户数据。必须登录后播放的页面可能无法解析。
-- 工具不执行网页 JavaScript，也不监听浏览器实时网络请求；高度动态的网站仍可能需要站点支持或用户提供公开媒体地址。
+- 桌面端自身不执行第三方页面脚本或常驻监听；浏览器伴侣只在用户点击“检测当前页面”时注入隔离扫描，高度动态的网站仍可能需要站点支持或用户提供公开媒体地址。
+- 浏览器伴侣只查看页面已经暴露给 DOM/Resource Timing 的资源；跨域受限 iframe、`blob:` MediaSource、隐藏接口和 DRM 播放器可能无法发现。
+- 浏览器伴侣当前通过开发者模式安装，尚未提交 Chrome Web Store 或 Edge Add-ons，也暂未支持 Firefox。
 - 原生 HLS 下载暂未实现 `EXT-X-BYTERANGE` 字节范围分片；这类公开媒体会优先尝试通用解析器。
 - `yt-dlp` 的站点支持会随上游网站变化。遇到解析回归时，先升级 `yt-dlp` 并查看活动日志。
 - YouTube、DASH 以及分离音视频流通常需要系统 PATH 中可访问 `ffmpeg`。
@@ -100,6 +117,8 @@ dist\UniversalVideoDownloader\UniversalVideoDownloader.exe
 
 当前版本会把图标和 `yt-dlp` 一起打入 exe。若需要更稳定的 YouTube 音视频合并，请确保系统 PATH 中可访问 `ffmpeg`。
 
+构建还会生成 `UniversalVideoDownloaderBridge.exe`，并把 `browser-extension` 与 `install_browser_companion.ps1` 放入同一便携目录。
+
 品牌主图位于 `assets/app_brand_v2.png`，Windows 多尺寸图标位于 `assets/app_icon_v2.ico`。旧版图标仍保留在仓库中用于版本追溯。
 
 正式便携包同时包含 `README.md`、`CHANGELOG.md`、`LICENSE` 和 `THIRD_PARTY_NOTICES.md`，并提供独立 SHA-256 校验文件。
@@ -110,7 +129,7 @@ dist\UniversalVideoDownloader\UniversalVideoDownloader.exe
 python -m pytest -q
 ```
 
-测试用例只使用合成页面、本地 HTTP 服务、示例域名和协议解析样例，不包含真实视频资源、账号、Cookie、Token 或私有站点信息。测试覆盖播放列表解析、断点续传、通用网页回退、格式与字幕归一化、质量选择、批量输出规划、候选去重、错误分类、历史原子写入、敏感信息脱敏和 UI 事件合并。
+测试用例只使用合成页面、本地 HTTP 服务、示例域名和协议解析样例，不包含真实视频资源、账号、Cookie、Token 或私有站点信息。测试覆盖播放列表解析、断点续传、通用网页回退、格式与字幕归一化、质量选择、批量输出规划、浏览器输入白名单、Native Messaging 帧、加密临时收件箱、候选去重、错误分类、历史原子写入、敏感信息脱敏和 UI 事件合并。
 
 ## 开源脱敏说明
 

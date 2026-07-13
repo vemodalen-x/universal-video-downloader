@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>浏览器伴侣</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header>
+      <img class="brand-mark" src="icon.png" alt="">
+      <div>
+        <h1>浏览器伴侣</h1>
+        <p>Universal Video Downloader</p>
+      </div>
+    </header>
+
+    <main>
+      <button id="detect" class="primary" type="button">检测当前页面</button>
+      <p id="status" class="status" role="status">仅在点击后检查当前标签页，不读取 Cookie 或浏览历史。</p>
+      <section id="results" class="results" aria-live="polite"></section>
+    </main>
+
+    <footer>
+      <span>当前标签页</span>
+      <span class="privacy">主动检测</span>
+    </footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

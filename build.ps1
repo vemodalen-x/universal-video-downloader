@@ -16,7 +16,19 @@ python -m PyInstaller `
   --add-data "assets\app_icon_v2_64.png;assets" `
   m3u8_desktop_app.py
 
+python -m PyInstaller `
+  --noconfirm `
+  --clean `
+  --onefile `
+  --console `
+  --name "UniversalVideoDownloaderBridge" `
+  --icon "assets\app_icon_v2.ico" `
+  browser_native_host.py
+
 $distDir = Join-Path $PSScriptRoot "dist\UniversalVideoDownloader"
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "dist\UniversalVideoDownloaderBridge.exe") -Destination $distDir -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "browser_extension") -Destination (Join-Path $distDir "browser-extension") -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install_browser_companion.ps1") -Destination $distDir -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "README.md") -Destination $distDir -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "CHANGELOG.md") -Destination $distDir -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "LICENSE") -Destination $distDir -Force
