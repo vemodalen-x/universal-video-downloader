@@ -1,6 +1,7 @@
 from pathlib import Path
 import struct
 import threading
+from types import SimpleNamespace
 import zlib
 
 import m3u8_desktop_app
@@ -10,6 +11,8 @@ from m3u8_desktop_app import (
     UI_REFRESH_INTERVAL_MS,
     UniversalVideoDownloaderApp,
     _available_output_path,
+    _browser_companion_installed_extension_path,
+    _browser_companion_package_paths,
     _candidate_format_label,
     _candidate_summary,
     _history_status_label,
@@ -22,6 +25,53 @@ def test_ui_refresh_budget_and_segment_cap() -> None:
     assert UI_REFRESH_INTERVAL_MS >= 100
     assert UI_REFRESH_INTERVAL_MS <= 100
     assert MAX_SEGMENT_BLOCKS <= 200
+
+
+def test_browser_companion_package_paths_are_portable(tmp_path) -> None:
+    installer, bridge, extension = _browser_companion_package_paths(tmp_path)
+
+    assert installer == tmp_path / "install_browser_companion.ps1"
+    assert bridge == tmp_path / "UniversalVideoDownloaderBridge.exe"
+    assert extension == tmp_path / "browser-extension"
+    assert _browser_companion_installed_extension_path(tmp_path) == (
+        tmp_path / "UniversalVideoDownloader" / "browser-companion" / "extension"
+    )
+
+
+def test_browser_companion_setup_worker_uses_argument_list(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="registered", stderr="")
+
+    monkeypatch.setattr(m3u8_desktop_app.subprocess, "run", fake_run)
+    app = object.__new__(UniversalVideoDownloaderApp)
+    app.event_buffer = CoalescingEventBuffer()
+    installer = tmp_path / "install_browser_companion.ps1"
+    extension = tmp_path / "browser-extension"
+
+    app._browser_companion_setup_worker(installer, extension)
+
+    assert captured["command"][-2:] == ["-File", str(installer)]
+    assert captured["kwargs"]["check"] is False
+    assert "shell" not in captured["kwargs"]
+    assert app.event_buffer.drain() == [("browser_companion_installed", {"extension": str(extension)})]
+
+
+def test_browser_companion_setup_worker_reports_failure(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        m3u8_desktop_app.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="", stderr="registration denied"),
+    )
+    app = object.__new__(UniversalVideoDownloaderApp)
+    app.event_buffer = CoalescingEventBuffer()
+
+    app._browser_companion_setup_worker(tmp_path / "install.ps1", tmp_path / "extension")
+
+    assert app.event_buffer.drain() == [("browser_companion_install_error", {"error": "registration denied"})]
 
 
 def test_output_path_avoids_overwriting_existing_file(tmp_path) -> None:

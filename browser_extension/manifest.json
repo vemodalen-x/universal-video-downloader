@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Universal Video Downloader Companion",
+  "version": "1.0.0",
+  "description": "Detect public media on the active tab and send a selected URL to the Windows desktop client.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn4SM05ZM9tqRSsclCPqGaKvE3FDI9bcRmlRspFunlyYyTSTr5DINImB7vyu9JwFm5maRXm+bEXys6dpbaSKWp81PJluNKvT9wOq+1hX3nToBdyJTCZzb5WlcL637Bcd/Gh/vCRkCGAOjLTYg5nnjJkY4QTHL3YM4lphF4Zl8B0Gx2Vscxnorah5VEh5pWbeTCcqWZxCUjIHkq3nIDopFE7wbiBJa79OD1QqEL3NyPM6yU8czAr/hBKX3OHzK34IvkrjxfGGtoQn5P2H9mPex9pd0GG77N9P0IRQqzwEapxd01b7cRrU14On9/BTgclQZ0zyCiGVWjGHqi4+5yrDYQwIDAQAB",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "nativeMessaging"
+  ],
+  "icons": {
+    "16": "icon.png",
+    "32": "icon.png",
+    "48": "icon.png",
+    "64": "icon.png"
+  },
+  "action": {
+    "default_title": "检测当前页面媒体",
+    "default_icon": {
+      "16": "icon.png",
+      "32": "icon.png",
+      "48": "icon.png"
+    },
+    "default_popup": "popup.html"
+  }
+}

@@ -6,6 +6,10 @@ Priority-zero yt-dlp workflow update.
 
 ### Added
 
+- Chrome/Edge active-tab companion for explicit, on-demand detection of public HLS, DASH, and direct-video resources.
+- Native Messaging bridge with strict message schemas, HTTP(S)-only URL validation, and credential-bearing field rejection.
+- AES-GCM encrypted browser inbox capped at 20 entries and 15 minutes, with Windows DPAPI protection for its local key.
+- Current-user registration script for Chrome and Edge native messaging hosts.
 - Quality presets for best available, 1080p maximum, 720p maximum, and smaller-file downloads.
 - Playlist and multi-video expansion with up to 50 visible entries, multi-selection, select-all, and sequential queue execution.
 - Normalized format metadata for resolution, frame rate, dynamic range, codecs, bitrate, estimated size, and protocol.
@@ -14,12 +18,15 @@ Priority-zero yt-dlp workflow update.
 
 ### Improved
 
+- Desktop client now consumes browser candidates through the existing Referer-aware analysis workflow without opening a localhost network service.
+- Portable builds now include the native host executable, unpacked extension, and registration script.
 - Every queued item receives an independent history record and collision-safe output path.
 - A failed queue item no longer prevents remaining selected entries from downloading.
 - Media selection now distinguishes playlist titles while keeping detailed stream metadata in a dedicated view.
 
 ### Tests
 
+- Added coverage for browser message validation, encrypted one-time handoff, expiry and queue limits, native-message framing, least-privilege extension permissions, and stable extension identity.
 - Added coverage for bounded quality selectors, subtitle postprocessors, no-FFmpeg behavior, playlist normalization, media metadata, and duplicate batch filenames.
 
 ## v1.1.0 - 2026-07-11

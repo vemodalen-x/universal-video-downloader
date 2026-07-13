@@ -1,0 +1,151 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  background: #f3f4f6;
+  color: #181a1f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 372px;
+  min-height: 260px;
+  margin: 0;
+  background: #f3f4f6;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 15px 17px;
+  background: #111827;
+  color: #ffffff;
+}
+
+.brand-mark {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+}
+
+h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+header p {
+  margin: 2px 0 0;
+  color: #aeb8c8;
+  font-size: 10px;
+}
+
+main {
+  padding: 14px;
+}
+
+button {
+  min-height: 34px;
+  border: 1px solid #d5d9e0;
+  border-radius: 5px;
+  padding: 7px 12px;
+  background: #ffffff;
+  color: #202329;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+button:hover {
+  background: #f7f8fa;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+
+.primary {
+  width: 100%;
+  border-color: #1677ff;
+  background: #1677ff;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.primary:hover {
+  background: #0f68e0;
+}
+
+.status {
+  margin: 10px 2px 0;
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.status.error {
+  color: #b4232a;
+}
+
+.status.success {
+  color: #18794e;
+}
+
+.results {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.media-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid #dfe3e9;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.media-title {
+  overflow: hidden;
+  color: #24262a;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-meta {
+  margin-top: 3px;
+  overflow: hidden;
+  color: #747b87;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.send {
+  min-width: 62px;
+  border-color: #c9d9ee;
+  color: #1559a6;
+}
+
+footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 9px 16px 11px;
+  border-top: 1px solid #e1e4e9;
+  color: #7b818b;
+  font-size: 10px;
+}
+
+.privacy {
+  color: #18794e;
+}
