@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 - 2026-07-14
 
-Priority-zero yt-dlp workflow update.
+Browser companion and native HLS compatibility update.
 
 ### Added
 
@@ -28,6 +28,7 @@ Priority-zero yt-dlp workflow update.
 ### Tests
 
 - Added coverage for browser message validation, encrypted one-time handoff, expiry and queue limits, native-message framing, least-privilege extension permissions, and stable extension identity.
+- Added native HLS byte-range parser, initialization-range, strict `Content-Range`, ignored-range, and within-range continuation coverage.
 - Added coverage for bounded quality selectors, subtitle postprocessors, no-FFmpeg behavior, playlist normalization, media metadata, and duplicate batch filenames.
 
 ## v1.1.0 - 2026-07-11

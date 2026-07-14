@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(1, 2, 0, 0),
+    prodvers=(1, 2, 0, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'Universal Video Downloader Contributors'),
           StringStruct(u'FileDescription', u'Universal Video Downloader'),
-          StringStruct(u'FileVersion', u'1.1.0.0'),
+          StringStruct(u'FileVersion', u'1.2.0.0'),
           StringStruct(u'InternalName', u'UniversalVideoDownloader'),
           StringStruct(u'LegalCopyright', u'Academic research and non-commercial use'),
           StringStruct(u'OriginalFilename', u'UniversalVideoDownloader.exe'),
           StringStruct(u'ProductName', u'Universal Video Downloader'),
-          StringStruct(u'ProductVersion', u'1.1.0')
+          StringStruct(u'ProductVersion', u'1.2.0')
         ]
       )
     ]),
