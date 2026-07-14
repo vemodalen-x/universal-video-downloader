@@ -62,6 +62,12 @@ class SegmentKey:
 
 
 @dataclass(frozen=True)
+class ByteRange:
+    offset: int
+    length: int
+
+
+@dataclass(frozen=True)
 class Segment:
     index: int
     url: str
@@ -69,6 +75,7 @@ class Segment:
     file_name: str
     key: Optional[SegmentKey] = None
     is_init: bool = False
+    byte_range: Optional[ByteRange] = None
 
 
 @dataclass(frozen=True)
@@ -396,6 +403,49 @@ def fetch_binary(
         return written
 
 
+def fetch_binary_range(
+    url: str,
+    path: Path,
+    byte_range: ByteRange,
+    headers: Optional[dict[str, str]] = None,
+    stop_event: Optional[threading.Event] = None,
+    chunk_size: int = 256 * 1024,
+) -> int:
+    """Fetch one exact HLS byte range and resume only within that interval."""
+
+    if byte_range.offset < 0 or byte_range.length <= 0:
+        raise HlsError("HLS 字节范围无效")
+    written = path.stat().st_size if path.exists() else 0
+    if written > byte_range.length:
+        path.unlink(missing_ok=True)
+        written = 0
+    if written == byte_range.length:
+        return written
+
+    request_start = byte_range.offset + written
+    request_end = byte_range.offset + byte_range.length - 1
+    request_headers = dict(headers or make_headers())
+    request_headers["Accept-Encoding"] = "identity"
+    request_headers["Range"] = f"bytes={request_start}-{request_end}"
+
+    with _http_session().get(url, headers=request_headers, stream=True, timeout=(10, 45)) as response:
+        response.raise_for_status()
+        bounds = _response_range_bounds(response)
+        if response.status_code != 206 or bounds != (request_start, request_end):
+            raise HlsError("服务器未按请求返回 HLS 字节范围")
+        with path.open("ab" if written else "wb") as handle:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if stop_event and stop_event.is_set():
+                    raise HlsError("任务已停止")
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                written += len(chunk)
+    if written != byte_range.length:
+        raise HlsError(f"HLS 字节范围长度不匹配：预期 {byte_range.length} 字节，实际 {written} 字节")
+    return written
+
+
 def parse_attribute_list(raw: str) -> dict[str, str]:
     attrs: dict[str, str] = {}
     i = 0
@@ -430,6 +480,16 @@ def parse_attribute_list(raw: str) -> dict[str, str]:
     return attrs
 
 
+def _parse_byte_range(raw: str) -> tuple[int, Optional[int]]:
+    parts = raw.strip().split("@")
+    if len(parts) not in {1, 2} or not parts[0].isdigit() or (len(parts) == 2 and not parts[1].isdigit()):
+        raise PlaylistParseError("HLS 字节范围格式无效")
+    length = int(parts[0])
+    if length <= 0:
+        raise PlaylistParseError("HLS 字节范围长度必须大于零")
+    return length, int(parts[1]) if len(parts) == 2 else None
+
+
 def parse_playlist(url: str, text: str) -> PlaylistInfo:
     lines = [line.strip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
     if not lines or lines[0] != "#EXTM3U":
@@ -445,6 +505,8 @@ def parse_playlist(url: str, text: str) -> PlaylistInfo:
     target_duration = 0.0
     total_duration = 0.0
     has_byterange = False
+    pending_byterange: Optional[tuple[int, Optional[int]]] = None
+    previous_media_range: Optional[tuple[str, ByteRange]] = None
 
     for line in lines[1:]:
         if line.startswith("#EXT-X-STREAM-INF:"):
@@ -473,7 +535,10 @@ def parse_playlist(url: str, text: str) -> PlaylistInfo:
             continue
 
         if line.startswith("#EXT-X-BYTERANGE:"):
+            if pending_byterange is not None:
+                raise PlaylistParseError("连续的 HLS 字节范围标签缺少媒体 URI")
             has_byterange = True
+            pending_byterange = _parse_byte_range(line.split(":", 1)[1])
             continue
 
         if line.startswith("#EXT-X-KEY:"):
@@ -498,6 +563,13 @@ def parse_playlist(url: str, text: str) -> PlaylistInfo:
             attrs = parse_attribute_list(line.split(":", 1)[1])
             uri = attrs.get("URI")
             if uri:
+                map_range = None
+                if "BYTERANGE" in attrs:
+                    length, offset = _parse_byte_range(attrs["BYTERANGE"])
+                    if offset is None:
+                        raise PlaylistParseError("EXT-X-MAP 字节范围必须指定起始位置")
+                    map_range = ByteRange(offset=offset, length=length)
+                    has_byterange = True
                 segments.append(
                     Segment(
                         index=len(segments),
@@ -506,6 +578,7 @@ def parse_playlist(url: str, text: str) -> PlaylistInfo:
                         file_name=f"{len(segments):06d}{_extension_from_url(uri, '.init')}",
                         key=current_key,
                         is_init=True,
+                        byte_range=map_range,
                     )
                 )
             continue
@@ -526,18 +599,34 @@ def parse_playlist(url: str, text: str) -> PlaylistInfo:
             sequence_number = media_sequence + media_segment_index
             key = SegmentKey(key.method, key.uri, f"{sequence_number:032x}")
 
+        segment_url = urljoin(url, line)
+        byte_range = None
+        if pending_byterange is not None:
+            length, offset = pending_byterange
+            if offset is None:
+                if previous_media_range is None or previous_media_range[0] != segment_url:
+                    raise PlaylistParseError("HLS 隐式字节范围缺少同 URI 的前一媒体分片")
+                offset = previous_media_range[1].offset + previous_media_range[1].length
+            byte_range = ByteRange(offset=offset, length=length)
+            pending_byterange = None
+
         segments.append(
             Segment(
                 index=len(segments),
-                url=urljoin(url, line),
+                url=segment_url,
                 duration=current_duration,
                 file_name=f"{len(segments):06d}{_extension_from_url(line, '.ts')}",
                 key=key,
+                byte_range=byte_range,
             )
         )
+        previous_media_range = (segment_url, byte_range) if byte_range else None
         total_duration += current_duration
         current_duration = 0.0
         media_segment_index += 1
+
+    if pending_byterange is not None:
+        raise PlaylistParseError("EXT-X-BYTERANGE 后缺少媒体 URI")
 
     media = None
     if segments:
@@ -575,8 +664,6 @@ def load_playlist_info_with_fallbacks(
 def load_best_media_playlist(url: str, headers: Optional[dict[str, str]] = None) -> MediaPlaylist:
     info = load_playlist_info(url, headers=headers)
     if info.media:
-        if info.media.has_byterange:
-            raise PlaylistParseError("该 HLS 使用字节范围分片，请改用通用解析器下载")
         return info.media
     if not info.variants:
         raise PlaylistParseError("没有发现可下载的视频分片")
@@ -585,8 +672,6 @@ def load_best_media_playlist(url: str, headers: Optional[dict[str, str]] = None)
     nested = load_playlist_info(best.url, headers=headers)
     if not nested.media:
         raise PlaylistParseError("清晰度列表没有指向可下载的视频分片")
-    if nested.media.has_byterange:
-        raise PlaylistParseError("该 HLS 使用字节范围分片，请改用通用解析器下载")
     return nested.media
 
 
@@ -684,9 +769,6 @@ def _discover_candidates_impl(
 
         effective_referer = effective_headers.get("Referer", "")
         if info.media:
-            if info.media.has_byterange:
-                _emit(callback, "log", level="info", message="检测到 HLS 字节范围分片，切换通用解析器")
-                continue
             candidate = _candidate_from_media(info.media, source_url, referer=effective_referer)
             if candidate.url not in seen:
                 candidates.append(candidate)
@@ -701,9 +783,6 @@ def _discover_candidates_impl(
                 )
                 media_info, media_headers = load_playlist_info_with_fallbacks(variant.url, variant_headers)
                 if not media_info.media:
-                    continue
-                if media_info.media.has_byterange:
-                    _emit(callback, "log", level="info", message="跳过原生下载不支持的 HLS 字节范围变体")
                     continue
                 candidate = _candidate_from_media(
                     media_info.media,
@@ -1216,7 +1295,16 @@ class DownloadJob:
             return
 
         part_path = final_path.with_suffix(final_path.suffix + ".part")
-        fetch_binary(segment.url, part_path, headers=self.headers, stop_event=self.stop_event)
+        if segment.byte_range:
+            fetch_binary_range(
+                segment.url,
+                part_path,
+                segment.byte_range,
+                headers=self.headers,
+                stop_event=self.stop_event,
+            )
+        else:
+            fetch_binary(segment.url, part_path, headers=self.headers, stop_event=self.stop_event)
 
         if segment.key:
             data = part_path.read_bytes()
@@ -1946,11 +2034,25 @@ def _response_total_size(response: requests.Response, start_at: int) -> int:
     return content_length
 
 
+def _response_range_bounds(response: requests.Response) -> Optional[tuple[int, int]]:
+    """Return inclusive bounds declared by Content-Range, or None when malformed."""
+
+    match = re.match(
+        r"bytes\s+(\d+)-(\d+)/(?:\d+|\*)\s*$",
+        response.headers.get("Content-Range", ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2))
+    return (start, end) if end >= start else None
+
+
 def _response_range_start(response: requests.Response) -> Optional[int]:
     """Return the first byte declared by a 206 response, or None when it is malformed."""
 
-    match = re.match(r"bytes\s+(\d+)-\d+/", response.headers.get("Content-Range", ""), flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    bounds = _response_range_bounds(response)
+    return bounds[0] if bounds else None
 
 
 def _normalize_iv(value: Optional[str]) -> Optional[str]:
