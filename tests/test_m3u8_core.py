@@ -3,14 +3,17 @@ from __future__ import annotations
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 import requests
 
 import m3u8_core
 from m3u8_core import (
     CoalescingEventBuffer,
     DirectDownloadJob,
+    DownloadJob,
     DownloadHistoryStore,
     DownloadRecord,
+    PlaylistParseError,
     VideoCandidate,
     _looks_like_direct_video_url,
     _looks_like_youtube_url,
@@ -62,11 +65,15 @@ seg-43.ts
     assert info.media.segments[1].key.iv_hex == "0000000000000000000000000000002b"
 
 
-def test_parse_media_playlist_marks_byte_range_segments() -> None:
+def test_parse_media_playlist_resolves_byte_range_segments_and_map() -> None:
     text = """#EXTM3U
 #EXT-X-TARGETDURATION:10
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="4@0"
 #EXTINF:10,
-#EXT-X-BYTERANGE:1024@0
+#EXT-X-BYTERANGE:1024@4
+video.mp4
+#EXTINF:10,
+#EXT-X-BYTERANGE:512
 video.mp4
 """
 
@@ -74,6 +81,247 @@ video.mp4
 
     assert info.media is not None
     assert info.media.has_byterange is True
+    assert [(segment.byte_range.offset, segment.byte_range.length) for segment in info.media.segments] == [
+        (0, 4),
+        (4, 1024),
+        (1028, 512),
+    ]
+
+
+def test_parse_media_playlist_rejects_implicit_range_without_matching_previous_segment() -> None:
+    text = """#EXTM3U
+#EXTINF:10,
+#EXT-X-BYTERANGE:1024
+video.mp4
+"""
+
+    with pytest.raises(PlaylistParseError, match="隐式字节范围"):
+        parse_playlist("https://example.com/video/index.m3u8", text)
+
+
+def test_load_best_media_playlist_accepts_byte_range_variant(monkeypatch) -> None:
+    master = parse_playlist(
+        "https://example.com/master.m3u8",
+        """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000
+media.m3u8
+""",
+    )
+    nested = parse_playlist(
+        "https://example.com/media.m3u8",
+        """#EXTM3U
+#EXTINF:4,
+#EXT-X-BYTERANGE:4@0
+media.bin
+""",
+    )
+    requested: list[str] = []
+
+    def fake_load(url: str, headers=None):
+        requested.append(url)
+        return master if url.endswith("master.m3u8") else nested
+
+    monkeypatch.setattr(m3u8_core, "load_playlist_info", fake_load)
+
+    playlist = m3u8_core.load_best_media_playlist("https://example.com/master.m3u8")
+
+    assert playlist is nested.media
+    assert requested == ["https://example.com/master.m3u8", "https://example.com/media.m3u8"]
+
+
+def test_hls_byterange_download_combines_init_and_media_ranges(tmp_path) -> None:
+    data = b"INITSEG1SEG2"
+    requested_ranges: list[str] = []
+    playlist_text = """#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="media.bin",BYTERANGE="4@0"
+#EXTINF:4,
+#EXT-X-BYTERANGE:4@4
+media.bin
+#EXTINF:4,
+#EXT-X-BYTERANGE:4
+media.bin
+"""
+
+    class RangeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/index.m3u8":
+                payload = playlist_text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path != "/media.bin":
+                self.send_error(404)
+                return
+            range_header = self.headers.get("Range", "")
+            requested_ranges.append(range_header)
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            start, end = int(start_text), int(end_text)
+            payload = data[start : end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        source_url = f"http://127.0.0.1:{server.server_port}/index.m3u8"
+        candidates = discover_candidates(source_url)
+        playlist = m3u8_core.load_best_media_playlist(source_url)
+        output_path = tmp_path / "byterange.mp4"
+        events: list[str] = []
+        DownloadJob(playlist, output_path, concurrency=1, retries=1, callback=lambda event, _payload: events.append(event)).run()
+
+        assert len(candidates) == 1
+        assert candidates[0].url == source_url
+        assert output_path.read_bytes() == data
+        assert requested_ranges == ["bytes=0-3", "bytes=4-7", "bytes=8-11"]
+        assert "completed" in events
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_hls_byterange_download_resumes_within_range(tmp_path) -> None:
+    data = b"HEADDATA"
+    requested_ranges: list[str] = []
+    playlist_text = """#EXTM3U
+#EXTINF:4,
+#EXT-X-BYTERANGE:4@4
+media.bin
+"""
+
+    class RangeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            range_header = self.headers.get("Range", "")
+            requested_ranges.append(range_header)
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            start, end = int(start_text), int(end_text)
+            payload = data[start : end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        playlist = parse_playlist(
+            f"http://127.0.0.1:{server.server_port}/index.m3u8",
+            playlist_text,
+        ).media
+        assert playlist is not None
+        output_path = tmp_path / "resume.mp4"
+        job = DownloadJob(playlist, output_path, concurrency=1, retries=1)
+        segment_path = job._segment_path(playlist.segments[0])
+        segment_path.parent.mkdir(parents=True)
+        segment_path.with_suffix(segment_path.suffix + ".part").write_bytes(b"DA")
+
+        job.run()
+
+        assert output_path.read_bytes() == b"DATA"
+        assert requested_ranges == ["bytes=6-7"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_hls_byterange_download_rejects_mismatched_content_range(tmp_path) -> None:
+    data = b"HEADDATA"
+    playlist_text = """#EXTM3U
+#EXTINF:4,
+#EXT-X-BYTERANGE:4@4
+media.bin
+"""
+
+    class MismatchedRangeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes 0-3/{len(data)}")
+            self.send_header("Content-Length", "4")
+            self.end_headers()
+            self.wfile.write(data[:4])
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MismatchedRangeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        playlist = parse_playlist(
+            f"http://127.0.0.1:{server.server_port}/index.m3u8",
+            playlist_text,
+        ).media
+        assert playlist is not None
+        events: list[str] = []
+        output_path = tmp_path / "rejected.mp4"
+
+        DownloadJob(playlist, output_path, concurrency=1, retries=1, callback=lambda event, _payload: events.append(event)).run()
+
+        assert not output_path.exists()
+        assert "fatal" not in events
+        assert "failed" in events
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_hls_byterange_download_rejects_server_ignoring_range(tmp_path) -> None:
+    data = b"HEADDATA"
+    requested_ranges: list[str] = []
+    playlist_text = """#EXTM3U
+#EXTINF:4,
+#EXT-X-BYTERANGE:4@4
+media.bin
+"""
+
+    class FullResponseHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requested_ranges.append(self.headers.get("Range", ""))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FullResponseHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        playlist = parse_playlist(
+            f"http://127.0.0.1:{server.server_port}/index.m3u8",
+            playlist_text,
+        ).media
+        assert playlist is not None
+        events: list[str] = []
+        output_path = tmp_path / "ignored-range.mp4"
+
+        DownloadJob(playlist, output_path, concurrency=1, retries=1, callback=lambda event, _payload: events.append(event)).run()
+
+        assert requested_ranges == ["bytes=4-7"]
+        assert not output_path.exists()
+        assert "fatal" not in events
+        assert "failed" in events
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_find_m3u8_urls_from_page_and_scripts() -> None:

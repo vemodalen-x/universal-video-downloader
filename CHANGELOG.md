@@ -18,6 +18,7 @@ Priority-zero yt-dlp workflow update.
 
 ### Improved
 
+- Native HLS now supports `EXT-X-BYTERANGE` media and initialization ranges, validates exact `206 Content-Range` responses, and resumes partial range segments without requesting bytes outside the declared interval.
 - Desktop client now consumes browser candidates through the existing Referer-aware analysis workflow without opening a localhost network service.
 - Portable builds now include the native host executable, unpacked extension, and registration script.
 - Every queued item receives an independent history record and collision-safe output path.
