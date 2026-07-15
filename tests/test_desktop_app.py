@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import zlib
 
 import m3u8_desktop_app
-from m3u8_core import CoalescingEventBuffer, DownloadPreferences, SubtitleTrack, VideoCandidate
+from m3u8_core import CoalescingEventBuffer, DownloadPreferences, DownloadRecord, SubtitleTrack, VideoCandidate
 from m3u8_desktop_app import (
     MAX_SEGMENT_BLOCKS,
     UI_REFRESH_INTERVAL_MS,
@@ -16,6 +16,8 @@ from m3u8_desktop_app import (
     _candidate_format_label,
     _candidate_summary,
     _history_status_label,
+    _history_filter_status,
+    _history_record_matches,
     _plan_output_paths,
     _subtitle_choice_map,
 )
@@ -183,6 +185,25 @@ def test_subtitle_choices_mark_automatic_only_languages() -> None:
         "ja": ("ja", False),
         "zh-Hans": ("zh-Hans", False),
     }
+
+
+def test_history_filter_matches_status_and_searchable_metadata() -> None:
+    record = DownloadRecord(
+        record_id="task-1",
+        title="Lecture 01",
+        source_type="hls",
+        source_url="https://example.com/watch",
+        source_host="example.com",
+        output_path="C:/Videos/Lecture 01.mp4",
+        status="failed",
+    )
+
+    assert _history_filter_status("需重试") == "failed"
+    assert _history_filter_status("全部状态") is None
+    assert _history_record_matches(record, "example.com", "需重试")
+    assert _history_record_matches(record, "lecture", "全部状态")
+    assert not _history_record_matches(record, "lecture", "已完成")
+    assert not _history_record_matches(record, "missing", "全部状态")
 
 
 def test_v2_brand_assets_cover_windows_icon_sizes() -> None:

@@ -104,11 +104,17 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.status_var = tk.StringVar(value="准备就绪")
         self.selection_var = tk.StringVar(value="输入链接并解析后，这里会显示可下载媒体")
         self.progress_detail_var = tk.StringVar(value="尚未开始任务")
+        self.candidate_count_var = tk.StringVar(value="等待解析")
+        self.history_query_var = tk.StringVar()
+        self.history_filter_var = tk.StringVar(value="全部状态")
+        self.history_summary_var = tk.StringVar(value="0 个任务")
 
         self._configure_style()
         self._build_ui()
         self._refresh_history()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind_all("<Control-l>", self._focus_url)
+        self.bind_all("<Control-Return>", self._shortcut_analyze)
         self.after(UI_REFRESH_INTERVAL_MS, self._drain_events)
         self.after(BROWSER_INBOX_INTERVAL_MS, self._poll_browser_inbox)
 
@@ -150,6 +156,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         style.configure("PageTitle.TLabel", background="#F3F4F6", foreground="#15171A", font=("Microsoft YaHei UI", 16, "bold"))
         style.configure("PageText.TLabel", background="#F3F4F6", foreground="#667085", font=("Microsoft YaHei UI", 9))
         style.configure("Badge.TLabel", background="#223047", foreground="#DCE7F7", font=("Microsoft YaHei UI", 8), padding=(9, 4))
+        style.configure("Status.TLabel", background="#1D2939", foreground="#D6E4FF", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 5))
+        style.configure("Eyebrow.TLabel", background="#FFFFFF", foreground="#1677FF", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Count.TLabel", background="#FFFFFF", foreground="#667085", font=("Microsoft YaHei UI", 9))
 
         style.configure(
             "TEntry",
@@ -211,6 +220,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
         ttk.Label(title_box, text=APP_TITLE, style="HeaderTitle.TLabel").pack(anchor=tk.W)
         ttk.Label(title_box, text="媒体发现、断点续传与本地任务管理", style="HeaderText.TLabel").pack(anchor=tk.W, pady=(2, 0))
 
+        self.status_badge = ttk.Label(header, textvariable=self.status_var, style="Status.TLabel")
+        self.status_badge.pack(side=tk.RIGHT, padx=(8, 0))
         capability_text = "FFmpeg 已就绪" if shutil.which("ffmpeg") else "FFmpeg 未检测到"
         ttk.Label(header, text=capability_text, style="Badge.TLabel").pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Label(header, text="HLS  /  HTTP  /  yt-dlp", style="Badge.TLabel").pack(side=tk.RIGHT)
@@ -252,15 +263,20 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.advanced_button = ttk.Button(title_row, text="显示高级选项", style="Link.TButton", command=self._toggle_advanced)
         self.advanced_button.grid(row=0, column=2, sticky=tk.E)
 
+        ttk.Label(source, text="粘贴一个网页、M3U8、HTTP 直链或 YouTube 地址，下载器会自动选择可用媒体。", style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky=tk.W, pady=(6, 0)
+        )
         self.url_entry = ttk.Entry(source, textvariable=self.url_var)
-        self.url_entry.grid(row=1, column=0, sticky=tk.EW, pady=(12, 0), padx=(0, 8))
+        self.url_entry.grid(row=2, column=0, sticky=tk.EW, pady=(12, 0), padx=(0, 8))
         self.url_entry.bind("<Return>", lambda _event: self._start_analyze())
-        ttk.Button(source, text="粘贴", command=self._paste_url).grid(row=1, column=1, pady=(12, 0), padx=(0, 8))
+        self.url_entry.bind("<Escape>", lambda _event: self._clear_url())
+        ttk.Button(source, text="粘贴", command=self._paste_url).grid(row=2, column=1, pady=(12, 0), padx=(0, 8))
+        ttk.Button(source, text="清空", style="Compact.TButton", command=self._clear_url).grid(row=2, column=2, pady=(12, 0), padx=(0, 8))
         self.analyze_button = ttk.Button(source, text="解析媒体", style="Primary.TButton", command=self._start_analyze)
-        self.analyze_button.grid(row=1, column=2, pady=(12, 0))
+        self.analyze_button.grid(row=2, column=3, pady=(12, 0))
 
         self.notice_frame = tk.Frame(source, bg="#E9F2FF", highlightthickness=0)
-        self.notice_frame.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0))
+        self.notice_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(12, 0))
         self.notice_frame.columnconfigure(1, weight=1)
         self.notice_title = tk.Label(self.notice_frame, text="", bg="#E9F2FF", fg="#1559A6", font=("Microsoft YaHei UI", 9, "bold"), anchor=tk.W)
         self.notice_title.grid(row=0, column=0, sticky=tk.W, padx=(12, 8), pady=9)
@@ -269,7 +285,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.notice_frame.grid_remove()
 
         self.advanced_frame = ttk.Frame(source, style="Surface.TFrame")
-        self.advanced_frame.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0))
+        self.advanced_frame.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(12, 0))
         self.advanced_frame.columnconfigure(1, weight=1)
         ttk.Label(self.advanced_frame, text="Referer", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
         ttk.Entry(self.advanced_frame, textvariable=self.referer_var).grid(row=0, column=1, sticky=tk.EW, padx=(0, 16))
@@ -293,8 +309,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         heading.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
         heading.columnconfigure(0, weight=1)
         ttk.Label(heading, text="可下载媒体", style="Section.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(heading, textvariable=self.candidate_count_var, style="Count.TLabel").grid(row=0, column=1, sticky=tk.E, padx=(8, 14))
         self.best_button = ttk.Button(heading, text="选择推荐项", command=self._select_best_candidate, state=tk.DISABLED)
-        self.best_button.grid(row=0, column=1, sticky=tk.E)
+        self.best_button.grid(row=0, column=2, sticky=tk.E)
         ttk.Label(candidates_frame, textvariable=self.selection_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(7, 10))
 
         columns = ("title", "quality", "format", "duration", "origin")
@@ -313,6 +330,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.candidate_tree.configure(yscrollcommand=tree_scroll.set)
         self.candidate_tree.grid(row=2, column=0, sticky=tk.NSEW)
         tree_scroll.grid(row=2, column=1, sticky=tk.NS)
+        self.candidate_empty_label = ttk.Label(
+            candidates_frame,
+            text="输入链接后，候选版本会显示在这里\n支持网页、M3U8、HTTP 直链和 YouTube",
+            style="Body.TLabel",
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+        )
+        self.candidate_empty_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_selection())
 
         action = ttk.Frame(workspace, style="Surface.TFrame", padding=12)
@@ -321,7 +346,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         action_heading = ttk.Frame(action, style="Surface.TFrame")
         action_heading.grid(row=0, column=0, sticky=tk.EW)
         action_heading.columnconfigure(0, weight=1)
-        ttk.Label(action_heading, text="保存与任务", style="Section.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(action_heading, text="下载设置", style="Section.TLabel").grid(row=0, column=0, sticky=tk.W)
         ttk.Button(action_heading, text="打开目录", style="Link.TButton", command=self._open_output_dir).grid(row=0, column=1, sticky=tk.E)
 
         output_row = ttk.Frame(action, style="Surface.TFrame")
@@ -447,9 +472,28 @@ class UniversalVideoDownloaderApp(tk.Tk):
         toolbar.columnconfigure(0, weight=1)
         ttk.Label(toolbar, text="本地任务记录", style="Section.TLabel").grid(row=0, column=0, sticky=tk.W)
         ttk.Label(toolbar, text="仅保存脱敏来源与本机输出信息", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(3, 0))
-        ttk.Button(toolbar, text="打开文件夹", command=self._open_history_output).grid(row=0, column=1, rowspan=2, padx=(8, 0))
-        ttk.Button(toolbar, text="重新填入", command=self._reuse_history).grid(row=0, column=2, rowspan=2, padx=(8, 0))
-        ttk.Button(toolbar, text="清除已完成", command=self._clear_completed_history).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+
+        self.history_search = ttk.Entry(toolbar, width=24)
+        self.history_search.insert(0, "搜索任务或来源")
+        self.history_search.configure(foreground="#98A2B3")
+        self.history_search.bind("<FocusIn>", self._clear_history_placeholder)
+        self.history_search.bind("<FocusOut>", self._restore_history_placeholder)
+        self.history_search.bind("<KeyRelease>", lambda _event: self._refresh_history())
+        self.history_search.grid(row=0, column=1, padx=(12, 8))
+        self.history_filter = ttk.Combobox(
+            toolbar,
+            textvariable=self.history_filter_var,
+            values=("全部状态", "下载中", "已完成", "需重试", "已暂停", "已中断", "已停止"),
+            state="readonly",
+            width=9,
+        )
+        self.history_filter.bind("<<ComboboxSelected>>", lambda _event: self._refresh_history())
+        self.history_filter.grid(row=0, column=2, padx=(0, 8))
+        self.history_summary_label = ttk.Label(toolbar, textvariable=self.history_summary_var, style="Count.TLabel")
+        self.history_summary_label.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=(12, 0), pady=(3, 0))
+        ttk.Button(toolbar, text="打开文件夹", command=self._open_history_output).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+        ttk.Button(toolbar, text="重新填入", style="Primary.TButton", command=self._reuse_history).grid(row=0, column=4, rowspan=2, padx=(8, 0))
+        ttk.Button(toolbar, text="清除已完成", command=self._clear_completed_history).grid(row=0, column=5, rowspan=2, padx=(8, 0))
 
         list_frame = ttk.Frame(tab, style="Surface.TFrame", padding=16)
         list_frame.grid(row=1, column=0, sticky=tk.NSEW, pady=(14, 0))
@@ -474,6 +518,16 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_tree.grid(row=0, column=0, sticky=tk.NSEW)
         scroll.grid(row=0, column=1, sticky=tk.NS)
         self.history_tree.bind("<Double-1>", lambda _event: self._open_history_output())
+        self.history_tree.bind("<Return>", lambda _event: self._reuse_history())
+        for status, color in {
+            "downloading": "#1677FF",
+            "completed": "#18794E",
+            "failed": "#B4232A",
+            "paused": "#8A5A00",
+            "interrupted": "#8A5A00",
+            "stopped": "#667085",
+        }.items():
+            self.history_tree.tag_configure(status, foreground=color)
 
     def _toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
@@ -492,6 +546,38 @@ class UniversalVideoDownloaderApp(tk.Tk):
         if value:
             self.url_var.set(value)
             self.url_entry.focus_set()
+
+    def _clear_url(self, _event=None) -> str:
+        if self.is_analyzing or self.is_downloading:
+            return "break"
+        self.url_var.set("")
+        self._clear_candidates()
+        self.selection_var.set("输入链接并解析后，这里会显示可下载媒体")
+        self._hide_notice()
+        self.status_var.set("准备就绪")
+        self.url_entry.focus_set()
+        return "break"
+
+    def _focus_url(self, _event=None) -> str:
+        self.main_notebook.select(self.download_tab)
+        self.url_entry.focus_set()
+        self.url_entry.selection_range(0, tk.END)
+        return "break"
+
+    def _shortcut_analyze(self, _event=None) -> str:
+        if not self.is_downloading and not self.is_analyzing:
+            self._start_analyze()
+        return "break"
+
+    def _clear_history_placeholder(self, _event=None) -> None:
+        if self.history_search.get() == "搜索任务或来源":
+            self.history_search.delete(0, tk.END)
+            self.history_search.configure(foreground="#17191C")
+
+    def _restore_history_placeholder(self, _event=None) -> None:
+        if not self.history_search.get().strip():
+            self.history_search.insert(0, "搜索任务或来源")
+            self.history_search.configure(foreground="#98A2B3")
 
     def _choose_output_dir(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(Path.home()))
@@ -800,7 +886,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
     def _clear_candidates(self) -> None:
         self.candidates = []
+        self.candidate_count_var.set("等待解析")
         self.selection_var.set("正在查找可下载媒体")
+        if hasattr(self, "candidate_empty_label"):
+            self.candidate_empty_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         for item in self.candidate_tree.get_children():
             self.candidate_tree.delete(item)
         if hasattr(self, "format_tree"):
@@ -1033,6 +1122,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.progress_detail_var.set("解析完成，等待开始下载")
         self._set_busy_analyzing(False)
         self.candidates = candidates
+        self.candidate_count_var.set(f"找到 {len(candidates)} 个版本")
+        if not candidates:
+            self.candidate_count_var.set("未找到可下载版本")
+            self.selection_var.set("没有可下载版本。可以补充 Referer，或从浏览器伴侣重新发送当前媒体。")
+            self.best_button.configure(state=tk.DISABLED)
+            self.start_button.configure(state=tk.DISABLED)
+            self._show_notice("warning", "没有找到可下载媒体", "请确认页面仍可访问；受保护页面可以尝试连接浏览器后重新解析。")
+            return
+        self.candidate_empty_label.place_forget()
         for index, candidate in enumerate(candidates):
             self.candidate_tree.insert(
                 "",
@@ -1215,11 +1313,19 @@ class UniversalVideoDownloaderApp(tk.Tk):
             return
         for item in self.history_tree.get_children():
             self.history_tree.delete(item)
-        for record in self.history_records:
+        query = self.history_search.get().strip() if hasattr(self, "history_search") else ""
+        if query == "搜索任务或来源":
+            query = ""
+        visible_records = [
+            record for record in self.history_records if _history_record_matches(record, query, self.history_filter_var.get())
+        ]
+        self.history_summary_var.set(f"{len(visible_records)} / {len(self.history_records)} 个任务")
+        for record in visible_records:
             self.history_tree.insert(
                 "",
                 tk.END,
                 iid=record.record_id,
+                tags=(record.status,),
                 values=(
                     record.title,
                     _history_type_label(record.source_type),
@@ -1241,6 +1347,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _open_history_output(self) -> None:
         record = self._selected_history()
         if not record:
+            self._show_notice("info", "请选择任务", "选择一条任务记录后，可以打开保存目录或查看任务详情。")
             return
         path = Path(record.output_path).expanduser().parent
         try:
@@ -1252,6 +1359,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _reuse_history(self) -> None:
         record = self._selected_history()
         if not record:
+            self._show_notice("info", "请选择任务", "选择一条任务记录后，点击“重新填入”即可继续解析或重试。")
             return
         self.url_var.set(record.source_url)
         output = Path(record.output_path)
@@ -1425,6 +1533,36 @@ def _history_status_label(status: str) -> str:
 
 def _history_type_label(source_type: str) -> str:
     return {"youtube": "YouTube", "ytdlp": "网页", "direct": "直链", "hls": "HLS"}.get(source_type, source_type.upper())
+
+
+def _history_filter_status(label: str) -> str | None:
+    return {
+        "下载中": "downloading",
+        "已完成": "completed",
+        "需重试": "failed",
+        "已暂停": "paused",
+        "已中断": "interrupted",
+        "已停止": "stopped",
+    }.get(label)
+
+
+def _history_record_matches(record: DownloadRecord, query: str, filter_label: str) -> bool:
+    expected_status = _history_filter_status(filter_label)
+    if expected_status and record.status != expected_status:
+        return False
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return True
+    searchable = " ".join(
+        (
+            record.title,
+            record.source_host,
+            record.source_type,
+            record.output_path,
+            _history_status_label(record.status),
+        )
+    ).casefold()
+    return normalized_query in searchable
 
 
 def _available_output_path(path: Path) -> Path:
