@@ -18,18 +18,21 @@ Browser companion and native HLS compatibility update.
 
 ### Improved
 
+- Redesigned the desktop analysis and history workflow with visible state, candidate counts, empty states, history search/status filters, and focused keyboard actions.
 - Native HLS now supports `EXT-X-BYTERANGE` media and initialization ranges, validates exact `206 Content-Range` responses, and resumes partial range segments without requesting bytes outside the declared interval.
 - Desktop client now consumes browser candidates through the existing Referer-aware analysis workflow without opening a localhost network service.
 - Portable builds now include the native host executable, unpacked extension, and registration script.
 - Every queued item receives an independent history record and collision-safe output path.
 - A failed queue item no longer prevents remaining selected entries from downloading.
 - Media selection now distinguishes playlist titles while keeping detailed stream metadata in a dedicated view.
+- Added hash-locked Windows release dependencies, an isolated build environment, commit-pinned GitHub Actions, automatic portable ZIP/SHA-256 generation, source/package privacy scanning, artifact provenance attestation, and tag-driven GitHub Release publishing.
 
 ### Tests
 
 - Added coverage for browser message validation, encrypted one-time handoff, expiry and queue limits, native-message framing, least-privilege extension permissions, and stable extension identity.
 - Added native HLS byte-range parser, initialization-range, strict `Content-Range`, ignored-range, and within-range continuation coverage.
 - Added coverage for bounded quality selectors, subtitle postprocessors, no-FFmpeg behavior, playlist normalization, media metadata, and duplicate batch filenames.
+- Added negative release scans for embedded local user paths, credential markers, screenshots, unapproved images, unsafe ZIP aliases, and private/transient files.
 
 ## v1.1.0 - 2026-07-11
 
