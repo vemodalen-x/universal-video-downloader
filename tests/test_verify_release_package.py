@@ -161,13 +161,34 @@ def test_scan_package_rejects_workspace_paths_in_binary_payloads(tmp_path: Path)
         scan_package(archive)
 
 
-def test_scan_package_allows_generic_upstream_build_paths_in_internal_runtime(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("entry", "payload"),
+    [
+        ("_internal/python-runtime.dll", b"C:\\src\\cpython\\python.c"),
+        ("_internal/vendor.dist-info/METADATA", br"C:\Users\<user name> and ${APPDATA}"),
+    ],
+)
+def test_scan_package_allows_generic_upstream_build_paths_in_internal_runtime(
+    tmp_path: Path,
+    entry: str,
+    payload: bytes,
+) -> None:
     archive = _write_package(
         tmp_path,
-        extra_entries={"_internal/python-runtime.dll": b"C:\\src\\cpython\\python.c"},
+        extra_entries={entry: payload},
     )
 
     assert scan_package(archive).archive == archive.resolve()
+
+
+def test_scan_package_rejects_user_paths_in_internal_runtime_metadata(tmp_path: Path) -> None:
+    archive = _write_package(
+        tmp_path,
+        extra_entries={"_internal/vendor.dist-info/METADATA": _local_user_path().encode()},
+    )
+
+    with pytest.raises(PackageScanError, match="local-path"):
+        scan_package(archive)
 
 
 def test_scan_package_rejects_arbitrary_absolute_paths_in_text(tmp_path: Path) -> None:

@@ -82,6 +82,10 @@ ABSOLUTE_TEXT_PATH_MARKER = re.compile(
     r"(?<![:a-z0-9])/(?:users|home|private|tmp|var/folders|volumes|mnt|workspaces?|repos?|src)/"
     r"[^\r\n\x00]+)"
 )
+VENDOR_PATH_TEMPLATE = re.compile(
+    r"(?i)(?:[a-z]:[\\/]+users[\\/]+|/(?:users|home)/)"
+    r"(?:<[^>\r\n]+>|%[a-z0-9_]+%|\$\{[a-z0-9_]+\})"
+)
 SCREEN_CAPTURE_NAME = re.compile(r"(?i)(?:^|[/_.-])(?:screen(?:shot|capture)|capture)(?:[/_.-]|$)")
 IMAGE_SUFFIXES = frozenset(
     {".avif", ".bmp", ".gif", ".heic", ".heif", ".ico", ".jpeg", ".jpg", ".jxl", ".png", ".svg", ".tif", ".tiff", ".webp"}
@@ -208,13 +212,18 @@ def _contains_local_path_marker(
     *,
     scan_all_text_paths: bool = False,
     scan_workspace_paths: bool = True,
+    allow_path_templates: bool = False,
 ) -> bool:
     markers = [LOCAL_PATH_MARKER]
     if scan_all_text_paths:
         markers.append(ABSOLUTE_TEXT_PATH_MARKER)
     elif scan_workspace_paths:
         markers.append(WORKSPACE_PATH_MARKER)
-    return any(marker.search(text) for text in _text_candidates(payload) for marker in markers)
+    for text in _text_candidates(payload):
+        candidate = VENDOR_PATH_TEMPLATE.sub("/vendor-placeholder", text) if allow_path_templates else text
+        if any(marker.search(candidate) for marker in markers):
+            return True
+    return False
 
 
 def _is_approved_package_image(name: str) -> bool:
@@ -260,10 +269,12 @@ def _scan_entries(archive: ZipFile) -> list[str]:
                 unsafe.append(f"oversized-text:{name}")
         if _contains_secret_marker(payload):
             markers.append(name)
+        is_internal_runtime = name.startswith("_internal/")
         if _contains_local_path_marker(
             payload,
-            scan_all_text_paths=is_text,
-            scan_workspace_paths=not name.startswith("_internal/"),
+            scan_all_text_paths=is_text and not is_internal_runtime,
+            scan_workspace_paths=not is_internal_runtime,
+            allow_path_templates=is_internal_runtime,
         ):
             unsafe.append(f"local-path:{name}")
     if forbidden:
