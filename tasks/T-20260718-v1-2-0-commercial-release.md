@@ -1,7 +1,7 @@
 ---
 id: T-20260718-v1-2-0-commercial-release
 risk: R2
-state: AcceptancePassed
+state: ProcedureCompleted
 scope_in:
   - m3u8_core.py
   - m3u8_desktop_app.py
@@ -58,7 +58,7 @@ approved_commands:
   - "Build scripts may replace generated contents under build/ and dist/."
   - "Push codex/v1.2.0-commercial-release and publish the reviewed v1.2.0 GitHub Release."
 owning_chat: "codex-20260718-commercial-release"
-heartbeat: 2026-07-18T10:57+08:00
+heartbeat: 2026-07-18T18:59+08:00
 ---
 
 # Universal Video Downloader v1.2.0 commercial release readiness
@@ -115,15 +115,17 @@ Publish a reproducible, privacy-sanitized Windows v1.2.0 package for Universal V
 - 2026-07-18T18:29+08:00 Hotfix limits broad workspace-path matching for approved `_internal` vendor content while retaining credential and local-user-directory detection, with positive and negative metadata fixtures.
 - 2026-07-18T18:33+08:00 Real `yt-dlp` wheel metadata regression, 60 scanner tests, full pytest 113, Ruff, and the local 1,066-entry package scan passed; template paths are accepted only in approved vendor content while concrete user paths remain blocked.
 - 2026-07-18T18:42+08:00 PowerShell transcript capture omitted native stdout, so hotfix evidence was regenerated with explicit command output at `.vemo/run/T-20260718-v1-2-0-commercial-release-hotfix-evidence.log`; it records the real-wheel regression, 60/113 tests, Ruff, scanner/hash, and refreshed VEMO receipt.
+- 2026-07-18T18:59+08:00 Release procedure completed: PRs #7/#8 merged, tag `v1.2.0` points to reviewed `main` commit `c212717`, workflow 29641556145 passed build/publish, and the public Release contains exactly ZIP+SHA256 with provenance attestations.
+- 2026-07-18T18:59+08:00 Downloaded public ZIP re-scan passed across 1,073 entries; GitHub digest, checksum asset, and computed SHA-256 all match `c82b5e7ae685fdfef29ce6777a1a137bc5f0de78c08f93cf8d27ba8786e1ae91`.
 
 ## Acceptance Result
 - PASS Correctness: full pytest reported 113 passed.
 - PASS Quality: Ruff, py_compile, PowerShell/YAML parsing, VEMO selfcheck, and governance eval 110/110 completed with exit 0.
 - PASS Build: isolated hash-locked Windows build produced both executables, the portable ZIP, and checksum.
-- PASS Security/Privacy: source/package scan passed across 1,066 ZIP entries; no photo data, screenshot, unapproved image, private path, credential marker, or Python source entry was accepted.
+- PASS Security/Privacy: the downloaded public package scan passed across 1,073 ZIP entries; no photo data, screenshot, unapproved image, private path, credential marker, or Python source entry was accepted.
 - PASS Supply chain: release and test dependencies are version/hash locked; CI builds under read-only permissions and grants write/attestation permissions only to the artifact publishing job.
-- PASS Release: both PE file/product versions are 1.2.0.0/1.2.0; desktop and bridge smoke checks passed; final SHA-256 is `a507ccd81f98f94de1729ade48b77320608d36b1dee2d1399e8fef74587a1d53`.
+- PASS Release: both PE file/product versions are 1.2.0.0/1.2.0; desktop and bridge smoke checks passed; public Release SHA-256 is `c82b5e7ae685fdfef29ce6777a1a137bc5f0de78c08f93cf8d27ba8786e1ae91`.
 - PASS Governance ground truth: comprehensive build evidence `.vemo/run/T-20260718-v1-2-0-commercial-release-release-evidence-final.log`, hotfix evidence `.vemo/run/T-20260718-v1-2-0-commercial-release-hotfix-evidence.log`, and refreshed VEMO receipt `.vemo/run/T-20260718-v1-2-0-commercial-release-20260718-183406.log` record all acceptance checks with exit 0.
 
 ## Conclusion
-Outcome: accepted | Decision: continue | Key Evidence: 113 tests, 110/110 governance eval, package scan and executable smoke passed | Risk: medium (unsigned executable is documented) | Next Action: obtain two clean independent judge passes and complete GitHub release procedure.
+Outcome: accepted | Decision: stop | Key Evidence: 113 tests, 110/110 governance eval, workflow 29641556145, two-asset Release, remote package scan and attestations passed | Risk: medium (unsigned executable is documented) | Next Action: archive this completed task during routine governance maintenance.
