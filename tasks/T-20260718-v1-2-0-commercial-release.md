@@ -111,15 +111,19 @@ Publish a reproducible, privacy-sanitized Windows v1.2.0 package for Universal V
 - 2026-07-18T18:10+08:00 Two fresh independent judges passed consecutively: supply-chain/release permissions and correctness/privacy/deliverability. Both high-confidence verdicts were recorded in `.vemo/judge.jsonl`.
 - 2026-07-18T18:12+08:00 PR #7 VEMO CI failed because the net change contained three superseded historical task records while CI generated a receipt only for the current release task.
 - 2026-07-18T18:16+08:00 Removed the three historical task records from the public PR diff without changing product code; the single release task now owns the complete delivery scope and CI receipt.
+- 2026-07-18T18:27+08:00 Tag workflow run 29640805769 passed dependency, version, main-target, test, and lint gates but package scanning rejected a generic upstream source-path example in Python 3.11 `yt-dlp` METADATA; no Release or partial assets were published.
+- 2026-07-18T18:29+08:00 Hotfix limits broad workspace-path matching for approved `_internal` vendor content while retaining credential and local-user-directory detection, with positive and negative metadata fixtures.
+- 2026-07-18T18:33+08:00 Real `yt-dlp` wheel metadata regression, 60 scanner tests, full pytest 113, Ruff, and the local 1,066-entry package scan passed; template paths are accepted only in approved vendor content while concrete user paths remain blocked.
+- 2026-07-18T18:42+08:00 PowerShell transcript capture omitted native stdout, so hotfix evidence was regenerated with explicit command output at `.vemo/run/T-20260718-v1-2-0-commercial-release-hotfix-evidence.log`; it records the real-wheel regression, 60/113 tests, Ruff, scanner/hash, and refreshed VEMO receipt.
 
 ## Acceptance Result
-- PASS Correctness: full pytest reported 111 passed.
+- PASS Correctness: full pytest reported 113 passed.
 - PASS Quality: Ruff, py_compile, PowerShell/YAML parsing, VEMO selfcheck, and governance eval 110/110 completed with exit 0.
 - PASS Build: isolated hash-locked Windows build produced both executables, the portable ZIP, and checksum.
 - PASS Security/Privacy: source/package scan passed across 1,066 ZIP entries; no photo data, screenshot, unapproved image, private path, credential marker, or Python source entry was accepted.
 - PASS Supply chain: release and test dependencies are version/hash locked; CI builds under read-only permissions and grants write/attestation permissions only to the artifact publishing job.
 - PASS Release: both PE file/product versions are 1.2.0.0/1.2.0; desktop and bridge smoke checks passed; final SHA-256 is `a507ccd81f98f94de1729ade48b77320608d36b1dee2d1399e8fef74587a1d53`.
-- PASS Governance ground truth: comprehensive evidence log `.vemo/run/T-20260718-v1-2-0-commercial-release-release-evidence-final.log` records the isolated build and every acceptance check with exit 0; refreshed VEMO receipt `.vemo/run/T-20260718-v1-2-0-commercial-release-20260718-180201.log` independently records build/smoke exit 0.
+- PASS Governance ground truth: comprehensive build evidence `.vemo/run/T-20260718-v1-2-0-commercial-release-release-evidence-final.log`, hotfix evidence `.vemo/run/T-20260718-v1-2-0-commercial-release-hotfix-evidence.log`, and refreshed VEMO receipt `.vemo/run/T-20260718-v1-2-0-commercial-release-20260718-183406.log` record all acceptance checks with exit 0.
 
 ## Conclusion
-Outcome: accepted | Decision: continue | Key Evidence: 111 tests, 110/110 governance eval, package scan and executable smoke passed | Risk: medium (unsigned executable is documented) | Next Action: obtain two clean independent judge passes and complete GitHub release procedure.
+Outcome: accepted | Decision: continue | Key Evidence: 113 tests, 110/110 governance eval, package scan and executable smoke passed | Risk: medium (unsigned executable is documented) | Next Action: obtain two clean independent judge passes and complete GitHub release procedure.
