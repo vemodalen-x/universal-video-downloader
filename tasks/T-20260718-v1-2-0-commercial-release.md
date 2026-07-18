@@ -109,6 +109,8 @@ Publish a reproducible, privacy-sanitized Windows v1.2.0 package for Universal V
 - 2026-07-18T17:54+08:00 Supply-chain judge failed the snapshot because CI installed pytest/Ruff without hashes inside the write-capable release job; all other release controls passed.
 - 2026-07-18T17:59+08:00 Remediation hash-locked pytest, Ruff, and all transitive wheels for Windows CPython 3.10/3.11, then split CI into a read-only build job and a separate least-privilege publish job connected only by pinned artifact actions. Cross-target hash resolution, workflow parsing, 111 tests, Ruff, and package scan passed.
 - 2026-07-18T18:10+08:00 Two fresh independent judges passed consecutively: supply-chain/release permissions and correctness/privacy/deliverability. Both high-confidence verdicts were recorded in `.vemo/judge.jsonl`.
+- 2026-07-18T18:12+08:00 PR #7 VEMO CI failed because the net change contained three superseded historical task records while CI generated a receipt only for the current release task.
+- 2026-07-18T18:16+08:00 Removed the three historical task records from the public PR diff without changing product code; the single release task now owns the complete delivery scope and CI receipt.
 
 ## Acceptance Result
 - PASS Correctness: full pytest reported 111 passed.
