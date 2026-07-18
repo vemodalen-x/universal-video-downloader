@@ -128,6 +128,7 @@ def test_extension_permissions_are_active_tab_only() -> None:
     manifest = json.loads((root / "browser_extension" / "manifest.json").read_text(encoding="utf-8"))
     permissions = set(manifest["permissions"])
 
+    assert manifest["version"] == "1.2.0"
     assert permissions == {"activeTab", "scripting", "nativeMessaging"}
     assert "host_permissions" not in manifest
     assert "background" not in manifest

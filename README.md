@@ -4,7 +4,7 @@
 
 > 本项目仅作为学术研究、技术学习和个人合法备份示例开源。请勿用于商业用途，请勿下载、传播或再分发没有授权的内容，请勿规避 DRM、访问控制、付费限制或版权保护机制。
 
-当前稳定版本：`v1.1.0`。下一版本功能见 [CHANGELOG.md](CHANGELOG.md) 的 Unreleased 部分。
+当前稳定版本：`v1.2.0`。完整更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 功能
 
@@ -108,10 +108,12 @@ python m3u8_desktop_app.py
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-构建完成后可执行文件位于：
+发行构建使用 `requirements-release.txt` 中固定版本及 SHA-256 wheel 哈希的 Windows 依赖，并在隔离虚拟环境中执行。GitHub Release 工作流固定官方 Action 的提交 SHA 和 Windows Runner 版本。构建完成后会自动执行源码与 ZIP 脱敏扫描，并生成：
 
 ```text
 dist\UniversalVideoDownloader\UniversalVideoDownloader.exe
+dist\UniversalVideoDownloader-v1.2.0-windows-x64.zip
+dist\SHA256SUMS-v1.2.0.txt
 ```
 
 当前版本会把图标和 `yt-dlp` 一起打入 exe。若需要更稳定的 YouTube 音视频合并，请确保系统 PATH 中可访问 `ffmpeg`。
@@ -120,7 +122,16 @@ dist\UniversalVideoDownloader\UniversalVideoDownloader.exe
 
 品牌主图位于 `assets/app_brand_v2.png`，Windows 多尺寸图标位于 `assets/app_icon_v2.ico`。旧版图标仍保留在仓库中用于版本追溯。
 
-正式便携包同时包含 `README.md`、`CHANGELOG.md`、`LICENSE` 和 `THIRD_PARTY_NOTICES.md`，并提供独立 SHA-256 校验文件。
+正式便携包同时包含 `README.md`、`RELEASE_NOTES.md`、`CHANGELOG.md`、`LICENSE` 和 `THIRD_PARTY_NOTICES.md`，并提供独立 SHA-256 校验文件。
+
+下载 Release 后可在 PowerShell 中验证：
+
+```powershell
+Get-FileHash .\UniversalVideoDownloader-v1.2.0-windows-x64.zip -Algorithm SHA256
+Get-Content .\SHA256SUMS-v1.2.0.txt
+```
+
+当前便携 EXE 未使用商业代码签名证书，Windows SmartScreen 可能显示“未知发布者”。请只从本仓库 Release 页面下载并核对 SHA-256；不要从第三方转载站获取可执行文件。
 
 ## 测试
 
@@ -135,6 +146,7 @@ python -m pytest -q
 - 仓库不包含真实下载任务、历史记录、浏览器 Cookie、认证头、账号密码、Token 或个人路径配置。
 - 测试和文档使用 `example.com`、`example.test` 等示例域名，不包含真实资源站点链接。
 - 项目只保留通用协议解析、下载调度、断点续传和桌面 UI 功能。
+- Release 流水线拒绝本机用户目录、凭据样式文本、照片归档数据、意外截图和未批准图片；公开 Release 只上传便携 ZIP 与 SHA-256 文件。
 - 不提供规避 DRM、破解付费访问、绕过登录授权或批量侵权分发的能力。
 
 ## 合规声明

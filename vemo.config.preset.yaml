@@ -2,7 +2,7 @@
 # which deep-merges over vemo.config.yaml). Only the stack-specific keys live here — everything else
 # inherits the template defaults. Convention over configuration.
 paths:
-  build: "python -m compileall -q m3u8_core.py m3u8_desktop_app.py photo_archive_core.py photo_archive_cli.py photo_archive_app.py tests"
+  build: "python -m compileall -q m3u8_core.py m3u8_desktop_app.py browser_companion.py browser_native_host.py tools tests"
   smoke: "python -m pytest tests -q"
   test_entry: ["tests/"]
 exclusions:

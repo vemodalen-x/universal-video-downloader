@@ -5,7 +5,7 @@
                                            "hooks":  [
                                                          {
                                                              "type":  "command",
-                                                             "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" session-start",
+                                                             "command":  "python enforcement/hooks/run.py session-start",
                                                              "timeout":  5
                                                          }
                                                      ]
@@ -17,7 +17,7 @@
                                          "hooks":  [
                                                        {
                                                            "type":  "command",
-                                                           "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" edit",
+                                                           "command":  "python enforcement/hooks/run.py edit",
                                                            "timeout":  5
                                                        }
                                                    ]
@@ -27,7 +27,7 @@
                                          "hooks":  [
                                                        {
                                                            "type":  "command",
-                                                           "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" command",
+                                                           "command":  "python enforcement/hooks/run.py command",
                                                            "timeout":  5
                                                        }
                                                    ]
@@ -38,7 +38,7 @@
                                          "hooks":  [
                                                        {
                                                            "type":  "command",
-                                                           "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" budget",
+                                                           "command":  "python enforcement/hooks/run.py budget",
                                                            "timeout":  5
                                                        }
                                                    ]
@@ -49,7 +49,7 @@
                                    "hooks":  [
                                                  {
                                                      "type":  "command",
-                                                     "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" stop",
+                                                     "command":  "python enforcement/hooks/run.py stop",
                                                      "timeout":  8
                                                  }
                                              ]
@@ -60,7 +60,7 @@
                                            "hooks":  [
                                                          {
                                                              "type":  "command",
-                                                             "command":  "python \"C:\\Users\\User\\Documents\\小工具\\enforcement\\hooks\\run.py\" subagent-stop",
+                                                             "command":  "python enforcement/hooks/run.py subagent-stop",
                                                              "timeout":  8
                                                          }
                                                      ]

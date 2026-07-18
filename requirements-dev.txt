@@ -1,0 +1,4 @@
+-r requirements-build.txt
+Pillow==12.3.0
+pytest==9.1.1
+ruff==0.15.22
