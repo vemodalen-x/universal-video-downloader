@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Baidu Netdisk `/s/` share recognition and complete-share batch downloads through a user-authorized BaiduPCS-Go connector.
+- A dedicated Baidu connector login action that opens an isolated console without exposing account input to the desktop process.
+- Hash-pinned BaiduPCS-Go v4.0.2 packaging, executable integrity verification, and bundled Apache-2.0 license text.
+- PikPak public-share discovery with optional extraction codes, cycle-safe nested-folder traversal, video metadata, and direct-media candidate mapping.
+- A masked desktop extraction-code field that remains only for the active queue, is cleared when the queue ends, and is never stored in candidates, history, or logs.
+- Actionable PikPak errors for missing or invalid extraction codes, unavailable shares, and browser verification requirements.
+- Browser TLS impersonation support for yt-dlp generic webpage discovery through the packaged curl_cffi transport.
+
+### Improved
+
+- Direct-media continuation now uses validated bounded byte ranges instead of open-ended ranges, allowing recovery from CDNs that require an explicit end offset while retaining zero-byte `200` compatibility.
+- Direct-media continuation keeps requesting bounded chunks when a valid `206` response omits the total size, and publishes only after the server explicitly confirms the final byte.
+- Local history now retains up to 2000 recent tasks and can recover from a valid atomic backup if the primary JSON file is interrupted or corrupted.
+- Failed, stopped, and interrupted history records can now re-analyze their privacy-safe source, match the original media, reuse the same task/output identity, and continue from local recovery data.
+- Native HLS retries now use a stable media cache key and adopt compatible URL-keyed legacy caches when temporary playlist signatures change.
+- Newly recorded YouTube tasks keep a query-free canonical video-ID path so history retry does not persist signed or unrelated query parameters.
+- Existing filenames in the selected save folder are now always excluded before queue startup; the desktop client reports skipped items and never offers to overwrite or create numbered duplicates.
+- Added privacy-preserving duplicate detection with stable SHA-256 media identities and in-batch deduplication.
+- Removed the 50-item media cap and the PikPak traversal count/depth/page caps, so supported playlists and shares expose every discovered video while retaining folder and pagination cycle protection.
+- Baidu share tasks require connector-confirmed transfer and download completion; newly created `.part`, `.download`, `.tmp`, or `.temp` files prevent false completion and keep the task retryable.
+- Baidu downloads use the same serial queue policy as other sources, retrying the current share up to three times before continuing.
+- PikPak direct media now uses bounded HTTP `.part` retries and refreshes expired temporary URLs by stable file ID without persisting extraction codes; shared HLS media uses the native playlist downloader.
+- Direct downloads keep partial bytes in an internal recovery cache across connection drops, rejected ranges, and explicit stops, and only publish the final file after validated byte completion.
+- Multi-file queues remain strictly serial but continue after an item exhausts its retries, preserving that item's internal resume cache while processing the rest of the selection.
+- Retryable batch items receive up to three queue-level attempts with cancellation-aware backoff and visible attempt status before the queue advances; permanent errors skip redundant retries.
+- Anonymous token refresh is bounded to one retry; interactive verification is handed back to the user instead of being automated.
+- Generic webpage metadata discovery and download now share the same scoped impersonation settings, without forcing impersonation on native direct/HLS requests.
+
+### Tests
+
+- Added synthetic coverage for Baidu route isolation, argument-list connector execution, extraction-code redaction, incomplete-file rejection, package binary integrity, protected PikPak shares, nested video discovery, metadata normalization, anonymous token refresh, stable-file URL refresh, dropped-stream continuation, rejected-range preservation, verification refusal, desktop argument forwarding, and presentation labels.
+
 ## v1.2.0 - 2026-07-14
 
 Browser companion and native HLS compatibility update.

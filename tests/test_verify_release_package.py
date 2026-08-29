@@ -10,6 +10,7 @@ from zipfile import ZipFile, ZipInfo
 
 import pytest
 
+import tools.verify_release_package as release_verifier
 from tools.verify_release_package import (
     REQUIRED_ENTRIES,
     PackageScanError,
@@ -17,6 +18,15 @@ from tools.verify_release_package import (
     scan_package,
     scan_source_tree,
 )
+
+
+@pytest.fixture(autouse=True)
+def _accept_synthetic_vendor_binary(monkeypatch) -> None:
+    monkeypatch.setitem(
+        release_verifier.PINNED_VENDOR_BINARY_SHA256,
+        "BaiduPCS-Go.exe",
+        hashlib.sha256(b"public release content").hexdigest(),
+    )
 
 
 def _credential_text() -> str:
@@ -128,6 +138,13 @@ def test_scan_package_rejects_credential_like_text(tmp_path: Path) -> None:
     archive = _write_package(tmp_path, extra_entries={"README.md": _credential_text().encode()})
 
     with pytest.raises(PackageScanError, match="credential-like text"):
+        scan_package(archive)
+
+
+def test_scan_package_rejects_modified_baidupcs_connector(tmp_path: Path) -> None:
+    archive = _write_package(tmp_path, extra_entries={"BaiduPCS-Go.exe": b"modified connector"})
+
+    with pytest.raises(PackageScanError, match="vendor-checksum"):
         scan_package(archive)
 
 
@@ -368,13 +385,33 @@ def test_v1_2_0_release_metadata_is_consistent() -> None:
     assert "## v1.2.0" in changelog
     assert "# Universal Video Downloader v1.2.0" in release_notes
     assert "requirements-release.txt" in build_script
+    assert "BaiduPCS-Go-v$connectorVersion-windows-x64.zip" in build_script
+    assert "ce72b3155a710b7c4a2b15611c3aebd11a057d7cccf0529e7703bdde04f0aa30" in build_script
+    assert "e44769b49156fa3f094431da87231021e6874b6519ea82da4b8af0637662576d" in build_script
     assert "--source-root" in build_script
-    assert "endswith(('.py', '.pyc'))" in app_spec
+    assert "EXCLUDED_DATA_SUFFIXES" in app_spec
+    assert ".dist-info/delvewheel" in app_spec
+    assert "for entry in a.datas" in app_spec
     bridge_spec = (root / "UniversalVideoDownloaderBridge.spec").read_text(encoding="utf-8")
     assert "bridge_version_info.txt" in bridge_spec
     assert "--require-hashes" in build_script
     release_requirements = (root / "requirements-release.txt").read_text(encoding="utf-8")
     assert release_requirements.count("--hash=sha256:") >= 24
+    assert "curl-cffi==0.15.0" in release_requirements
+    assert "rich==15.0.0" in release_requirements
+    assert "markdown-it-py==4.2.0" in release_requirements
+    assert "mdurl==0.1.2" in release_requirements
+    assert "cffi==2.0.0" in release_requirements
+    assert "pycparser==2.23" in release_requirements
+    assert "('yt_dlp', 'curl_cffi')" in app_spec
+    runtime_requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    third_party_notices = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert "curl-cffi==0.15.0" in runtime_requirements
+    assert "curl_cffi / curl-impersonate" in third_party_notices
+    assert "| BaiduPCS-Go v4.0.2 | Apache-2.0 |" in third_party_notices
+    assert "| Rich | MIT |" in third_party_notices
+    assert "| markdown-it-py | MIT |" in third_party_notices
+    assert "| mdurl | MIT |" in third_party_notices
     assert "pytest==9.1.1" in release_requirements
     assert "ruff==0.15.22" in release_requirements
     assert "git rev-parse origin/main" in release_workflow

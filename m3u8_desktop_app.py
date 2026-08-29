@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -13,10 +14,11 @@ from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 import tkinter as tk
 from tkinter import ttk
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from browser_companion import BrowserCompanionError, BrowserInbox
 from m3u8_core import (
+    BaiduPanDownloadJob,
     CoalescingEventBuffer,
     DirectDownloadJob,
     DownloadHistoryStore,
@@ -32,9 +34,11 @@ from m3u8_core import (
     default_history_path,
     discover_candidates,
     ffmpeg_capability,
+    find_baidupcs_executable,
     load_best_media_playlist,
     make_headers,
     redact_url,
+    refresh_pikpak_candidate,
     sanitize_file_name,
 )
 
@@ -44,6 +48,9 @@ APP_TITLE = "通用视频下载器"
 UI_REFRESH_INTERVAL_MS = 100
 BROWSER_INBOX_INTERVAL_MS = 1000
 MAX_SEGMENT_BLOCKS = 160
+BATCH_ITEM_MAX_ATTEMPTS = 3
+BATCH_ITEM_RETRY_BACKOFF_SECONDS = 1.5
+HISTORY_RETRY_STATES = frozenset({"failed", "stopped", "interrupted"})
 
 
 class UniversalVideoDownloaderApp(tk.Tk):
@@ -59,9 +66,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.event_buffer = CoalescingEventBuffer()
         self.browser_inbox = BrowserInbox()
         self.candidates: list[VideoCandidate] = []
-        self.current_job: DirectDownloadJob | DownloadJob | YouTubeDownloadJob | None = None
+        self.current_job: BaiduPanDownloadJob | DirectDownloadJob | DownloadJob | YouTubeDownloadJob | None = None
         self.current_candidate: VideoCandidate | None = None
         self.current_record_id = ""
+        self.pending_history_retry: DownloadRecord | None = None
+        self.history_retry_record_id = ""
         self.download_thread: threading.Thread | None = None
         self.queue_stop_event = threading.Event()
         self.queue_total = 0
@@ -92,6 +101,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         default_dir = Path.home() / "Downloads" / "Video Downloader"
         self.url_var = tk.StringVar()
         self.referer_var = tk.StringVar()
+        self.access_code_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(default_dir))
         self.file_name_var = tk.StringVar(value="video.mp4")
         self.concurrency_var = tk.IntVar(value=8)
@@ -263,7 +273,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.advanced_button = ttk.Button(title_row, text="显示高级选项", style="Link.TButton", command=self._toggle_advanced)
         self.advanced_button.grid(row=0, column=2, sticky=tk.E)
 
-        ttk.Label(source, text="粘贴一个网页、M3U8、HTTP 直链或 YouTube 地址，下载器会自动选择可用媒体。", style="Muted.TLabel").grid(
+        ttk.Label(source, text="粘贴网页、百度网盘、PikPak、M3U8、HTTP 直链或 YouTube 地址，下载器会自动选择处理方式。", style="Muted.TLabel").grid(
             row=1, column=0, columnspan=3, sticky=tk.W, pady=(6, 0)
         )
         self.url_entry = ttk.Entry(source, textvariable=self.url_var)
@@ -292,6 +302,21 @@ class UniversalVideoDownloaderApp(tk.Tk):
         ttk.Label(self.advanced_frame, text="并发", style="Muted.TLabel").grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
         ttk.Spinbox(self.advanced_frame, from_=1, to=32, textvariable=self.concurrency_var, width=7).grid(row=0, column=3, sticky=tk.W, padx=(0, 16))
         ttk.Checkbutton(self.advanced_frame, text="保留续传缓存", variable=self.keep_cache_var).grid(row=0, column=4, sticky=tk.W)
+        ttk.Label(self.advanced_frame, text="网盘提取码", style="Muted.TLabel").grid(
+            row=1, column=0, sticky=tk.W, padx=(0, 8), pady=(10, 0)
+        )
+        ttk.Entry(self.advanced_frame, textvariable=self.access_code_var, show="*", width=20).grid(
+            row=1, column=1, sticky=tk.W, padx=(0, 16), pady=(10, 0)
+        )
+        ttk.Label(self.advanced_frame, text="仅在本次下载的进程内使用，队列结束后清空", style="Muted.TLabel").grid(
+            row=1, column=2, columnspan=2, sticky=tk.W, pady=(10, 0)
+        )
+        self.baidupan_button = ttk.Button(
+            self.advanced_frame,
+            text="连接百度网盘",
+            command=self._start_baidupan_login,
+        )
+        self.baidupan_button.grid(row=1, column=4, sticky=tk.E, pady=(10, 0))
         self.advanced_frame.grid_remove()
 
         workspace = ttk.Frame(tab, style="App.TFrame")
@@ -492,7 +517,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_summary_label = ttk.Label(toolbar, textvariable=self.history_summary_var, style="Count.TLabel")
         self.history_summary_label.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=(12, 0), pady=(3, 0))
         ttk.Button(toolbar, text="打开文件夹", command=self._open_history_output).grid(row=0, column=3, rowspan=2, padx=(8, 0))
-        ttk.Button(toolbar, text="重新填入", style="Primary.TButton", command=self._reuse_history).grid(row=0, column=4, rowspan=2, padx=(8, 0))
+        self.history_retry_button = ttk.Button(
+            toolbar,
+            text="继续下载",
+            style="Primary.TButton",
+            command=self._retry_history,
+            state=tk.DISABLED,
+        )
+        self.history_retry_button.grid(row=0, column=4, rowspan=2, padx=(8, 0))
         ttk.Button(toolbar, text="清除已完成", command=self._clear_completed_history).grid(row=0, column=5, rowspan=2, padx=(8, 0))
 
         list_frame = ttk.Frame(tab, style="Surface.TFrame", padding=16)
@@ -518,7 +550,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_tree.grid(row=0, column=0, sticky=tk.NSEW)
         scroll.grid(row=0, column=1, sticky=tk.NS)
         self.history_tree.bind("<Double-1>", lambda _event: self._open_history_output())
-        self.history_tree.bind("<Return>", lambda _event: self._reuse_history())
+        self.history_tree.bind("<Return>", lambda _event: self._retry_history())
+        self.history_tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_history_actions())
         for status, color in {
             "downloading": "#1677FF",
             "completed": "#18794E",
@@ -548,9 +581,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.url_entry.focus_set()
 
     def _clear_url(self, _event=None) -> str:
+        """Reset a completed input flow and cancel any pending history continuation. @codex-comment"""
+
         if self.is_analyzing or self.is_downloading:
             return "break"
+        self.pending_history_retry = None
+        self.history_retry_record_id = ""
         self.url_var.set("")
+        self.access_code_var.set("")
         self._clear_candidates()
         self.selection_var.set("输入链接并解析后，这里会显示可下载媒体")
         self._hide_notice()
@@ -593,12 +631,20 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._show_error(classify_error(exc))
 
     def _start_analyze(self) -> None:
+        """Validate input and retain query-based share codes only for the active queue. @codex-comment"""
+
         url = self.url_var.get().strip()
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             self._show_notice("warning", "链接格式不正确", "请输入完整的 http 或 https 视频页面、媒体直链或播放列表地址。")
             self.url_entry.focus_set()
             return
+
+        access_code = self.access_code_var.get().strip()
+        if not access_code:
+            access_code = _share_access_code_from_url(url)
+            if access_code:
+                self.access_code_var.set(access_code)
 
         self._hide_notice()
         self._set_busy_analyzing(True)
@@ -609,39 +655,68 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.progress_detail_var.set("正在检查页面、媒体地址和通用解析器")
         self._draw_segments(0)
         self._log("开始解析媒体：" + redact_url(url))
-        threading.Thread(target=self._analyze_worker, args=(url, self.referer_var.get().strip()), daemon=True).start()
+        threading.Thread(
+            target=self._analyze_worker,
+            args=(url, self.referer_var.get().strip(), access_code),
+            daemon=True,
+        ).start()
 
-    def _analyze_worker(self, url: str, referer: str) -> None:
+    def _analyze_worker(self, url: str, referer: str, access_code: str) -> None:
         try:
-            candidates = discover_candidates(url, referer=referer, callback=self._core_callback)
+            candidates = discover_candidates(
+                url,
+                referer=referer,
+                callback=self._core_callback,
+                access_code=access_code,
+            )
             self.event_buffer.put("analysis_done", {"candidates": candidates})
         except Exception as exc:
             self.event_buffer.put("analysis_error", {"error": exc})
 
     def _start_download(self) -> None:
-        candidates = self._selected_candidates()
-        if not candidates:
+        """Deduplicate selected media, resolve existing-output policy, and start the serial queue. @codex-comment"""
+
+        selected_candidates = self._selected_candidates()
+        if not selected_candidates:
+            self.history_retry_record_id = ""
             self._show_notice("warning", "尚未选择媒体", "先解析链接，然后选择一个或多个媒体条目。")
             return
+        candidates, repeated_selection_count = _deduplicate_candidates(selected_candidates)
 
         output_dir = Path(self.output_dir_var.get()).expanduser()
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
+            self.history_retry_record_id = ""
             self._show_error(classify_error(exc))
             return
-        queue = _plan_output_paths(candidates, output_dir, self.file_name_var.get())
-        requested_name = sanitize_file_name(self.file_name_var.get(), "video")
-        if len(queue) == 1 and not Path(requested_name).suffix:
-            requested_name += _default_suffix_for_candidate(candidates[0])
-        if len(queue) == 1 and queue[0][1].name != requested_name:
+        queue = _plan_output_paths(
+            candidates,
+            output_dir,
+            self.file_name_var.get(),
+            avoid_existing=False,
+        )
+        queue, skipped_existing_count = _filter_duplicate_queue(queue, self.history_records)
+
+        if not queue:
+            self.history_retry_record_id = ""
+            total_skipped = repeated_selection_count + skipped_existing_count
+            self._show_notice("info", "没有需要下载的项目", f"已跳过 {total_skipped} 个重复或已存在的视频。")
+            self._log(f"重复检测已跳过 {total_skipped} 个条目")
+            return
+        if len(queue) == 1 and queue[0][0].source_type != "baidupan":
             self.file_name_var.set(queue[0][1].name)
-            self._show_notice("info", "已避免覆盖现有文件", f"本次将保存为 {queue[0][1].name}")
+        if repeated_selection_count or skipped_existing_count:
+            total_skipped = repeated_selection_count + skipped_existing_count
+            self._show_notice("info", "已跳过重复视频", f"已跳过 {total_skipped} 项，其余 {len(queue)} 项将继续下载。")
+            self._log(f"重复检测已跳过 {total_skipped} 个条目")
 
         concurrency = max(1, min(32, int(self.concurrency_var.get())))
         keep_cache = self.keep_cache_var.get()
         preferences = self._download_preferences()
         referer_override = self.referer_var.get().strip()
+        share_source_url = self.url_var.get().strip()
+        share_access_code = self.access_code_var.get().strip()
 
         self.current_candidate = None
         self.current_record_id = ""
@@ -661,7 +736,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
         self.download_thread = threading.Thread(
             target=self._download_worker,
-            args=(queue, concurrency, keep_cache, preferences, referer_override),
+            args=(
+                queue,
+                concurrency,
+                keep_cache,
+                preferences,
+                referer_override,
+                share_source_url,
+                share_access_code,
+            ),
             daemon=True,
         )
         self.download_thread.start()
@@ -673,7 +756,16 @@ class UniversalVideoDownloaderApp(tk.Tk):
         keep_cache: bool,
         preferences: DownloadPreferences,
         referer_override: str,
+        share_source_url: str = "",
+        share_access_code: str = "",
+        pikpak_source_url: str = "",
+        pikpak_access_code: str = "",
+        overwrite_existing: bool = False,
     ) -> None:
+        """Run selected media serially, retrying retryable items before advancing. @codex-comment"""
+
+        share_source_url = share_source_url or pikpak_source_url
+        share_access_code = share_access_code or pikpak_access_code
         completed = 0
         failed = 0
         stopped = False
@@ -693,35 +785,96 @@ class UniversalVideoDownloaderApp(tk.Tk):
                 else:
                     self._core_callback(event, payload)
 
-            try:
-                referer = referer_override or candidate.referer or candidate.source_url
-                headers = make_headers(referer)
-                if candidate.source_type in {"youtube", "ytdlp"}:
-                    job = YouTubeDownloadJob(
-                        candidate.url,
-                        output_path,
-                        concurrency=concurrency,
-                        referer=referer,
-                        callback=queue_callback,
-                        preferences=preferences,
-                    )
-                elif candidate.source_type == "direct":
-                    job = DirectDownloadJob(candidate.url, output_path, headers=headers, callback=queue_callback)
-                else:
-                    playlist = load_best_media_playlist(candidate.url, headers=headers)
-                    job = DownloadJob(
-                        playlist=playlist,
-                        output_path=output_path,
-                        headers=headers,
-                        concurrency=concurrency,
-                        keep_cache=keep_cache,
-                        callback=queue_callback,
-                    )
-                self.current_job = job
-                self.event_buffer.put("job_ready", {"job": job})
-                job.run()
-            except Exception as exc:
-                terminal.update({"event": "fatal", "payload": {"error": exc}})
+            referer = referer_override or candidate.referer or candidate.source_url
+            headers = make_headers(referer)
+            for item_attempt in range(1, BATCH_ITEM_MAX_ATTEMPTS + 1):
+                terminal.clear()
+                try:
+                    if candidate.source_type == "baidupan":
+                        job = BaiduPanDownloadJob(
+                            candidate.source_url,
+                            output_path,
+                            access_code=share_access_code,
+                            callback=queue_callback,
+                        )
+                    elif candidate.source_type in {"youtube", "ytdlp"}:
+                        job = YouTubeDownloadJob(
+                            candidate.url,
+                            output_path,
+                            concurrency=concurrency,
+                            referer=referer,
+                            callback=queue_callback,
+                            preferences=preferences,
+                            overwrite_existing=overwrite_existing,
+                        )
+                    elif candidate.source_type in {"direct", "pikpak"}:
+                        url_refresher = None
+                        if candidate.source_type == "pikpak" and candidate.media_id:
+
+                            def refresh_url(current_candidate: VideoCandidate = candidate) -> str:
+                                """Refresh one temporary PikPak URL using process-memory-only credentials. @codex-comment"""
+
+                                refreshed = refresh_pikpak_candidate(
+                                    current_candidate,
+                                    share_source_url or current_candidate.source_url,
+                                    access_code=share_access_code,
+                                    callback=queue_callback,
+                                )
+                                return refreshed.url
+
+                            url_refresher = refresh_url
+                        job = DirectDownloadJob(
+                            candidate.url,
+                            output_path,
+                            headers=headers,
+                            callback=queue_callback,
+                            url_refresher=url_refresher,
+                            resume_key=candidate.media_id or candidate.source_url,
+                        )
+                    else:
+                        playlist = load_best_media_playlist(candidate.url, headers=headers)
+                        job = DownloadJob(
+                            playlist=playlist,
+                            output_path=output_path,
+                            headers=headers,
+                            concurrency=concurrency,
+                            keep_cache=keep_cache,
+                            callback=queue_callback,
+                            resume_key=_candidate_media_key(candidate),
+                        )
+                    self.current_job = job
+                    self.event_buffer.put("job_ready", {"job": job})
+                    job.run()
+                except Exception as exc:
+                    terminal.update({"event": "fatal", "payload": {"error": exc}})
+
+                terminal_event = str(terminal.get("event") or "fatal")
+                terminal_payload = terminal.get("payload") if isinstance(terminal.get("payload"), dict) else {}
+                if terminal_event in {"completed", "stopped"}:
+                    break
+
+                error = terminal_payload.get("error") or terminal_payload.get("message") or "媒体下载未完成"
+                if self.queue_stop_event.is_set():
+                    terminal.update({"event": "stopped", "payload": {}})
+                    break
+                if item_attempt >= BATCH_ITEM_MAX_ATTEMPTS or not classify_error(error).retryable:
+                    break
+
+                next_attempt = item_attempt + 1
+                self.event_buffer.put(
+                    "queue_item_retry",
+                    {
+                        "error": error,
+                        "index": index,
+                        "total": len(queue),
+                        "attempt": next_attempt,
+                        "max_attempts": BATCH_ITEM_MAX_ATTEMPTS,
+                    },
+                )
+                delay = min(5.0, BATCH_ITEM_RETRY_BACKOFF_SECONDS * item_attempt)
+                if self.queue_stop_event.wait(delay):
+                    terminal.update({"event": "stopped", "payload": {}})
+                    break
 
             terminal_event = str(terminal.get("event") or "fatal")
             terminal_payload = terminal.get("payload") if isinstance(terminal.get("payload"), dict) else {}
@@ -740,7 +893,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
         self.event_buffer.put(
             "queue_finished",
-            {"completed": completed, "failed": failed, "total": len(queue), "stopped": stopped},
+            {
+                "completed": completed,
+                "failed": failed,
+                "total": len(queue),
+                "stopped": stopped,
+            },
         )
 
     def _toggle_pause(self) -> None:
@@ -803,12 +961,17 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._sync_selection()
 
     def _sync_selection(self) -> None:
+        """Reflect candidate type and batch shape in output controls and task details. @codex-comment"""
+
         candidates = self._selected_candidates()
         if not candidates:
             return
         candidate = candidates[0]
         file_stem = sanitize_file_name(candidate.title.split(" / ", 1)[0], "video")
-        self.file_name_var.set(file_stem + _default_suffix_for_candidate(candidate))
+        if candidate.source_type == "baidupan":
+            self.file_name_var.set("由分享目录决定")
+        else:
+            self.file_name_var.set(file_stem + _default_suffix_for_candidate(candidate))
         if len(candidates) > 1:
             self.selection_var.set(f"已选择 {len(candidates)} 个条目 · 将按标题依次下载")
             self.start_button.configure(text=f"下载选中项 ({len(candidates)})")
@@ -903,9 +1066,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.start_button.configure(state=tk.DISABLED)
 
     def _set_busy_analyzing(self, busy: bool) -> None:
+        """Reflect analysis state in primary and history actions. @codex-comment"""
+
         self.is_analyzing = busy
         self.analyze_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         self.status_var.set("正在解析媒体" if busy else "等待开始下载")
+        self._sync_history_actions()
 
     def _poll_browser_inbox(self) -> None:
         try:
@@ -948,6 +1114,33 @@ class UniversalVideoDownloaderApp(tk.Tk):
             daemon=True,
         ).start()
 
+    def _start_baidupan_login(self) -> None:
+        """Open the isolated connector login console without reading account credentials. @codex-comment"""
+
+        connector = find_baidupcs_executable()
+        if connector is None:
+            self._show_notice("warning", "百度网盘连接器缺失", "请使用包含 BaiduPCS-Go 的完整 Windows 便携包。")
+            return
+        approved = messagebox.askyesno(
+            "连接百度网盘",
+            "将打开独立的百度网盘连接器终端。账号输入和授权状态由连接器管理，本软件不会读取输入内容。是否继续？",
+            parent=self,
+        )
+        if not approved:
+            return
+        try:
+            subprocess.Popen(
+                [str(connector), "login"],
+                cwd=connector.parent,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+        except OSError as exc:
+            self._show_error(classify_error(HlsError("百度网盘连接器无法启动")))
+            self._log(f"百度网盘连接器启动失败：{exc}", "warning")
+            return
+        self.status_var.set("等待百度网盘登录")
+        self._show_notice("info", "已打开百度网盘连接器", "在独立终端完成登录后，返回客户端重新开始下载。")
+
     def _browser_companion_setup_worker(self, installer: Path, extension: Path) -> None:
         try:
             completed = subprocess.run(
@@ -975,15 +1168,22 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.event_buffer.put("browser_companion_install_error", {"error": str(exc)})
 
     def _set_downloading_state(self, active: bool) -> None:
+        """Enable only controls supported by the current provider job. @codex-comment"""
+
         self.is_downloading = active
         self.start_button.configure(state=tk.DISABLED if active else (tk.NORMAL if self.candidates else tk.DISABLED))
         self.analyze_button.configure(state=tk.DISABLED if active else tk.NORMAL)
-        pause_supported = active and self.current_candidate is not None and self.current_candidate.source_type != "ytdlp" and self.current_candidate.source_type != "youtube"
+        pause_supported = (
+            active
+            and self.current_candidate is not None
+            and self.current_candidate.source_type not in {"baidupan", "ytdlp", "youtube"}
+        )
         self.pause_button.configure(state=tk.NORMAL if pause_supported else tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL if active else tk.DISABLED)
         self.partial_button.configure(state=tk.NORMAL if active and self.current_candidate and self.current_candidate.source_type == "hls" else tk.DISABLED)
         if not active:
             self.pause_button.configure(text="暂停")
+        self._sync_history_actions()
 
     def _core_callback(self, event: str, payload: dict) -> None:
         self.event_buffer.put(event, payload)
@@ -994,13 +1194,28 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.after(UI_REFRESH_INTERVAL_MS, self._drain_events)
 
     def _handle_event(self, event: str, payload: dict) -> None:
+        """Apply coalesced worker events and clear in-memory share codes at terminal states. @codex-comment"""
+
         if event == "analysis_done":
             self._on_analysis_done(payload["candidates"])
         elif event == "analysis_error":
+            retry_record = self.pending_history_retry
+            self.pending_history_retry = None
+            self.access_code_var.set("")
             self.progress.stop()
             self.progress.configure(mode="determinate", value=0)
             self._set_busy_analyzing(False)
-            self._show_error(classify_error(payload.get("error", "解析失败")))
+            if retry_record is not None:
+                error = classify_error(payload.get("error", "解析失败"))
+                self.status_var.set("历史任务无法继续")
+                self._log(f"历史任务重新解析失败：{error.detail or error.message}", "warning")
+                if error.code in {"pikpak_code_required", "pikpak_code_invalid", "baidupan_code_required", "baidupan_code_invalid"}:
+                    self.pending_history_retry = retry_record
+                    self._show_notice("warning", "需要重新输入提取码", "在高级选项中输入提取码后点击“解析媒体”，匹配成功后会自动继续下载。")
+                else:
+                    self._show_notice("warning", "需要更新原链接", "脱敏来源已失效，请粘贴原视频页面链接后重新解析。")
+            else:
+                self._show_error(classify_error(payload.get("error", "解析失败")))
         elif event == "browser_companion_installed":
             self.companion_button.configure(state=tk.NORMAL)
             extension = Path(str(payload.get("extension", "")))
@@ -1022,7 +1237,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
             candidate = payload["candidate"]
             output_path = Path(payload["output"])
             self.current_candidate = candidate
-            self.current_record_id = uuid.uuid4().hex
+            self.current_record_id = self.history_retry_record_id or uuid.uuid4().hex
+            self.history_retry_record_id = ""
             self._reset_progress_estimator()
             self._create_history_record(candidate, output_path)
             index = int(payload.get("index", 1))
@@ -1036,6 +1252,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._history_update(status="completed", progress=100.0, force=True)
             output = Path(str(payload.get("output", "")))
             self._log("已完成：" + output.name)
+        elif event == "queue_item_retry":
+            attempt = int(payload.get("attempt", 2))
+            max_attempts = int(payload.get("max_attempts", BATCH_ITEM_MAX_ATTEMPTS))
+            index = int(payload.get("index", 1))
+            total = int(payload.get("total", 1))
+            error = classify_error(payload.get("error", "媒体下载未完成"))
+            self.status_var.set(f"正在重试当前文件 {attempt}/{max_attempts}")
+            self.progress_detail_var.set(f"队列 {index}/{total} · 当前文件第 {attempt}/{max_attempts} 次尝试")
+            self._log(f"当前文件上次尝试失败：{error.message}；开始第 {attempt}/{max_attempts} 次尝试", "warning")
         elif event == "queue_item_failed":
             self.queue_failed += 1
             error = classify_error(payload.get("error", "媒体下载未完成"))
@@ -1045,6 +1270,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._history_update(status="stopped", force=True)
             self._log("当前条目已停止，剩余队列不再启动。")
         elif event == "queue_finished":
+            self.history_retry_record_id = ""
+            self.access_code_var.set("")
             self._set_downloading_state(False)
             self.current_job = None
             completed = int(payload.get("completed", 0))
@@ -1055,11 +1282,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
                 self._show_notice("info", "队列已停止", f"已完成 {completed}/{total} 项，已下载数据和续传缓存均已保留。")
             elif failed:
                 self.status_var.set("下载队列已完成，部分项目需重试")
-                self._show_notice("warning", "队列已完成", f"成功 {completed} 项，失败 {failed} 项；可从任务记录重新填入失败链接。")
+                self.progress_detail_var.set(f"已处理 {total} 项：完整下载 {completed} 项，失败 {failed} 项")
+                self._show_notice("warning", "队列已完成", f"成功 {completed} 项，失败 {failed} 项；可在任务记录中选择失败项继续下载。")
             else:
                 self.status_var.set("下载队列已完成")
                 self.progress_detail_var.set(f"已完成 {completed}/{total} 项")
-                self._show_notice("success", "下载完成", f"队列中的 {completed} 个媒体文件已写入保存目录。")
+                self._show_notice("success", "下载完成", f"队列中的 {completed} 个下载任务已完整写入保存目录。")
         elif event == "started":
             self._draw_segments(int(payload.get("total", 0)))
             self._history_update(status="downloading", force=True)
@@ -1117,6 +1345,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._log(str(payload.get("message", "")), str(payload.get("level", "info")))
 
     def _on_analysis_done(self, candidates: list[VideoCandidate]) -> None:
+        """Render discovered media or auto-continue one pending history retry. @codex-comment"""
+
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self.progress_detail_var.set("解析完成，等待开始下载")
@@ -1124,11 +1354,16 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.candidates = candidates
         self.candidate_count_var.set(f"找到 {len(candidates)} 个版本")
         if not candidates:
+            retry_record = self.pending_history_retry
+            self.pending_history_retry = None
             self.candidate_count_var.set("未找到可下载版本")
             self.selection_var.set("没有可下载版本。可以补充 Referer，或从浏览器伴侣重新发送当前媒体。")
             self.best_button.configure(state=tk.DISABLED)
             self.start_button.configure(state=tk.DISABLED)
-            self._show_notice("warning", "没有找到可下载媒体", "请确认页面仍可访问；受保护页面可以尝试连接浏览器后重新解析。")
+            if retry_record is not None:
+                self._show_notice("warning", "未找到原任务媒体", "请粘贴最新的原视频页面链接，再重新解析并选择该视频。")
+            else:
+                self._show_notice("warning", "没有找到可下载媒体", "请确认页面仍可访问；受保护页面可以尝试连接浏览器后重新解析。")
             return
         self.candidate_empty_label.place_forget()
         for index, candidate in enumerate(candidates):
@@ -1147,6 +1382,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         is_playlist = bool(candidates and candidates[0].playlist_count > 1)
         self.best_button.configure(state=tk.NORMAL, text="全选列表" if is_playlist else "选择推荐项")
         self.start_button.configure(state=tk.NORMAL)
+        if self.pending_history_retry is not None:
+            self._continue_history_after_analysis()
+            return
         if is_playlist:
             self.candidate_tree.selection_set("0")
             self.candidate_tree.focus("0")
@@ -1260,8 +1498,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         return "pending"
 
     def _create_history_record(self, candidate: VideoCandidate, output_path: Path) -> None:
-        source_url = redact_url(candidate.source_url or candidate.url)
+        """Create or restart local history without persisting signed URLs or access credentials. @codex-comment"""
+
+        source_url = _history_source_url(candidate)
         host = urlparse(source_url).hostname or ""
+        previous = next((item for item in self.history_records if item.record_id == self.current_record_id), None)
         record = DownloadRecord(
             record_id=self.current_record_id,
             title=sanitize_file_name(candidate.title.split(" / ", 1)[0], "video"),
@@ -1270,6 +1511,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
             source_host=host,
             output_path=str(output_path),
             status="preparing",
+            media_key=_candidate_media_key(candidate),
+            progress=previous.progress if previous else 0.0,
+            bytes_done=previous.bytes_done if previous else 0,
             updated_at=time.time(),
         )
         self.history_records = self.history_store.upsert(record)
@@ -1309,6 +1553,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._refresh_history()
 
     def _refresh_history(self) -> None:
+        """Apply search/status filters and refresh task actions for the visible history. @codex-comment"""
+
         if not hasattr(self, "history_tree"):
             return
         for item in self.history_tree.get_children():
@@ -1336,6 +1582,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
                     record.output_path,
                 ),
             )
+        self._sync_history_actions()
 
     def _selected_history(self) -> DownloadRecord | None:
         selection = self.history_tree.selection()
@@ -1343,6 +1590,20 @@ class UniversalVideoDownloaderApp(tk.Tk):
             return None
         record_id = selection[0]
         return next((item for item in self.history_records if item.record_id == record_id), None)
+
+    def _sync_history_actions(self) -> None:
+        """Enable history continuation only for inactive retryable records. @codex-comment"""
+
+        if not hasattr(self, "history_retry_button") or not hasattr(self, "history_tree"):
+            return
+        record = self._selected_history()
+        enabled = bool(
+            record
+            and record.status in HISTORY_RETRY_STATES
+            and not self.is_analyzing
+            and not self.is_downloading
+        )
+        self.history_retry_button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
     def _open_history_output(self) -> None:
         record = self._selected_history()
@@ -1356,18 +1617,64 @@ class UniversalVideoDownloaderApp(tk.Tk):
         except OSError as exc:
             self._show_error(classify_error(exc))
 
-    def _reuse_history(self) -> None:
+    def _retry_history(self) -> None:
+        """Re-analyze one retryable history source and continue into its original output path. @codex-comment"""
+
         record = self._selected_history()
         if not record:
-            self._show_notice("info", "请选择任务", "选择一条任务记录后，点击“重新填入”即可继续解析或重试。")
+            self._show_notice("info", "请选择任务", "选择一条需重试、已停止或已中断的任务后，点击“继续下载”。")
             return
+        if self.is_analyzing or self.is_downloading:
+            self._show_notice("info", "当前任务仍在运行", "当前解析或下载结束后，再继续历史任务。")
+            return
+        if record.status not in HISTORY_RETRY_STATES:
+            self._show_notice("info", "该任务无需重试", "只有需重试、已停止或已中断的任务可以继续下载。")
+            return
+        if not record.output_path:
+            self._show_notice("warning", "保存位置不可用", "这条旧记录缺少保存位置，请重新建立下载任务。")
+            return
+
         self.url_var.set(record.source_url)
-        output = Path(record.output_path)
-        self.output_dir_var.set(str(output.parent))
-        self.file_name_var.set(output.name)
+        output_dir, file_name = _history_output_settings(record)
+        self.output_dir_var.set(str(output_dir))
+        self.file_name_var.set(file_name)
         self.main_notebook.select(self.download_tab)
-        self.url_entry.focus_set()
-        self._show_notice("info", "任务信息已填入", "历史记录仅保留脱敏地址；若原链接带临时签名，请返回原视频页面重新解析。")
+        if not _history_retry_source_available(record):
+            self.pending_history_retry = None
+            self._show_notice("warning", "需要更新原链接", "这条旧记录只保留了脱敏地址，请粘贴完整的原视频页面链接后重新解析。")
+            self.url_entry.focus_set()
+            return
+
+        self.pending_history_retry = record
+        self._log(f"继续历史任务：{record.title}")
+        self._show_notice("info", "正在恢复历史任务", "正在重新确认媒体地址；匹配成功后会从本机续传缓存继续。")
+        self._start_analyze()
+
+    def _continue_history_after_analysis(self) -> None:
+        """Match a pending history item, restore its output, and start exactly one retry queue. @codex-comment"""
+
+        record = self.pending_history_retry
+        self.pending_history_retry = None
+        if record is None:
+            return
+        candidate_index = _history_retry_candidate_index(record, self.candidates)
+        if candidate_index is None:
+            self.status_var.set("未找到原任务媒体")
+            self._log(f"历史任务未匹配到原媒体：{record.title}", "warning")
+            self._show_notice("warning", "未找到原任务媒体", "解析结果与历史记录不一致，请粘贴最新原链接并手动选择对应视频。")
+            return
+
+        iid = str(candidate_index)
+        self.candidate_tree.selection_set(iid)
+        self.candidate_tree.focus(iid)
+        self.candidate_tree.see(iid)
+        self._sync_selection()
+        output_dir, file_name = _history_output_settings(record)
+        self.output_dir_var.set(str(output_dir))
+        self.file_name_var.set(file_name)
+        self.history_retry_record_id = record.record_id
+        self._show_notice("info", "继续下载", f"正在从已有进度继续 {Path(record.output_path).name}。")
+        self._start_download()
 
     def _clear_completed_history(self) -> None:
         self.history_records = self.history_store.clear_completed()
@@ -1429,6 +1736,21 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
+def _share_access_code_from_url(url: str) -> str:
+    """Extract a provider-scoped query code without persisting the source URL. @codex-comment"""
+
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host not in {"pan.baidu.com", "mypikpak.com", "mypikpak.net"}:
+        return ""
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    for key in ("pwd", "s_code"):
+        value = str((query.get(key) or [""])[0]).strip()
+        if value:
+            return value[:128]
+    return ""
+
+
 def _format_size(value: float) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     size = float(value)
@@ -1451,22 +1773,35 @@ def _format_eta(seconds: float) -> str:
 
 
 def _default_suffix_for_candidate(candidate: VideoCandidate) -> str:
+    if candidate.source_type == "baidupan":
+        return ""
     if candidate.source_type in {"youtube", "ytdlp"}:
         return ".mp4"
-    if candidate.source_type == "direct":
+    if candidate.source_type in {"direct", "pikpak"}:
+        if candidate.container:
+            return "." + candidate.container.lstrip(".").lower()
         suffix = Path(candidate.url.split("?", 1)[0]).suffix.lower()
         return suffix if suffix else ".mp4"
     return ".ts"
 
 
 def _candidate_kind_label(candidate: VideoCandidate) -> str:
-    return {"youtube": "YouTube", "ytdlp": "网页媒体", "direct": "视频直链", "hls": "HLS"}.get(candidate.source_type, "媒体")
+    return {
+        "youtube": "YouTube",
+        "ytdlp": "网页媒体",
+        "direct": "视频直链",
+        "pikpak": "PikPak 分享",
+        "baidupan": "百度网盘分享",
+        "hls": "HLS",
+    }.get(candidate.source_type, "媒体")
 
 
 def _candidate_format_label(candidate: VideoCandidate) -> str:
+    if candidate.source_type == "baidupan":
+        return "目录"
     if candidate.container:
         return candidate.container.upper()
-    if candidate.source_type == "direct":
+    if candidate.source_type in {"direct", "pikpak"}:
         return Path(urlparse(candidate.url).path).suffix.lstrip(".").upper() or "VIDEO"
     if candidate.source_type == "hls":
         return "M3U8"
@@ -1474,9 +1809,11 @@ def _candidate_format_label(candidate: VideoCandidate) -> str:
 
 
 def _candidate_engine_label(candidate: VideoCandidate) -> str:
+    if candidate.source_type == "baidupan":
+        return "BaiduPCS-Go"
     if candidate.source_type in {"youtube", "ytdlp"}:
         return "yt-dlp"
-    if candidate.source_type == "direct":
+    if candidate.source_type in {"direct", "pikpak"}:
         return "HTTP"
     return "HLS / AES" if candidate.encrypted else "HLS"
 
@@ -1488,9 +1825,11 @@ def _candidate_origin_label(candidate: VideoCandidate) -> str:
 
 
 def _candidate_structure_label(candidate: VideoCandidate) -> str:
+    if candidate.source_type == "baidupan":
+        return "完整分享目录"
     if candidate.source_type in {"youtube", "ytdlp"}:
         return "自动选择并合并"
-    if candidate.source_type == "direct":
+    if candidate.source_type in {"direct", "pikpak"}:
         return "单文件续传"
     return f"{candidate.segment_count} 个分片" if candidate.segment_count else "HLS 播放列表"
 
@@ -1532,7 +1871,14 @@ def _history_status_label(status: str) -> str:
 
 
 def _history_type_label(source_type: str) -> str:
-    return {"youtube": "YouTube", "ytdlp": "网页", "direct": "直链", "hls": "HLS"}.get(source_type, source_type.upper())
+    return {
+        "youtube": "YouTube",
+        "ytdlp": "网页",
+        "direct": "直链",
+        "pikpak": "PikPak",
+        "baidupan": "百度网盘",
+        "hls": "HLS",
+    }.get(source_type, source_type.upper())
 
 
 def _history_filter_status(label: str) -> str | None:
@@ -1565,6 +1911,127 @@ def _history_record_matches(record: DownloadRecord, query: str, filter_label: st
     return normalized_query in searchable
 
 
+def _history_source_url(candidate: VideoCandidate) -> str:
+    """Return a query-free retry source, using a canonical YouTube ID path when available. @codex-comment"""
+
+    media_id = candidate.media_id.strip()
+    safe_media_id = bool(media_id) and len(media_id) <= 128 and all(character.isalnum() or character in "_-" for character in media_id)
+    if candidate.source_type == "youtube" and safe_media_id:
+        return f"https://youtu.be/{media_id}"
+    return redact_url(candidate.source_url or candidate.url)
+
+
+def _history_retry_source_available(record: DownloadRecord) -> bool:
+    """Reject legacy retry sources whose essential query identity was removed. @codex-comment"""
+
+    parsed = urlparse(record.source_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if record.source_type == "youtube":
+        if host == "youtu.be":
+            return bool(parsed.path.strip("/"))
+        if host.endswith("youtube.com") and parsed.path.rstrip("/") == "/watch":
+            return bool(parse_qs(parsed.query).get("v"))
+    return True
+
+
+def _history_output_settings(record: DownloadRecord) -> tuple[Path, str]:
+    """Map a history output to the directory and filename controls expected by its provider. @codex-comment"""
+
+    output = Path(record.output_path).expanduser()
+    if record.source_type == "baidupan":
+        return output, "由分享目录决定"
+    return output.parent, output.name
+
+
+def _history_retry_candidate_index(record: DownloadRecord, candidates: list[VideoCandidate]) -> int | None:
+    """Match exact media identity first, then one unambiguous title/type fallback. @codex-comment"""
+
+    if record.media_key:
+        exact = [index for index, candidate in enumerate(candidates) if _candidate_media_key(candidate) == record.media_key]
+        if len(exact) == 1:
+            return exact[0]
+
+    title_matches = [
+        index
+        for index, candidate in enumerate(candidates)
+        if candidate.source_type == record.source_type
+        and sanitize_file_name(candidate.title.split(" / ", 1)[0], "video").casefold() == record.title.casefold()
+    ]
+    if len(title_matches) == 1:
+        return title_matches[0]
+    same_type = [index for index, candidate in enumerate(candidates) if candidate.source_type == record.source_type]
+    if len(candidates) == 1 and len(same_type) == 1:
+        return same_type[0]
+    return None
+
+
+def _candidate_media_key(candidate: VideoCandidate) -> str:
+    """Hash a credential-free stable provider ID or media URL for duplicate detection. @codex-comment"""
+
+    source_type = candidate.source_type.strip().lower() or "unknown"
+    if candidate.media_id:
+        identity = f"{source_type}|id|{candidate.media_id.strip()}"
+    else:
+        raw_url = candidate.source_url if source_type == "baidupan" else (candidate.url or candidate.source_url)
+        normalized_url = redact_url(raw_url)
+        identity = f"{source_type}|url|{normalized_url}"
+        source_url = redact_url(candidate.source_url)
+        if candidate.playlist_index and normalized_url == source_url:
+            identity += f"|playlist-index|{candidate.playlist_index}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _deduplicate_candidates(candidates: list[VideoCandidate]) -> tuple[list[VideoCandidate], int]:
+    """Keep the first occurrence of each stable media identity. @codex-comment"""
+
+    unique: list[VideoCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        media_key = _candidate_media_key(candidate)
+        if media_key in seen:
+            continue
+        seen.add(media_key)
+        unique.append(candidate)
+    return unique, len(candidates) - len(unique)
+
+
+def _duplicate_queue_indices(
+    queue: list[tuple[VideoCandidate, Path]],
+    history_records: list[DownloadRecord],
+) -> set[int]:
+    """Find queue items backed by an existing target or an available completed-history output. @codex-comment"""
+
+    completed_media = {
+        record.media_key
+        for record in history_records
+        if record.status == "completed"
+        and record.media_key
+        and record.output_path
+        and Path(record.output_path).expanduser().exists()
+    }
+    duplicates: set[int] = set()
+    for index, (candidate, output_path) in enumerate(queue):
+        target_exists = candidate.source_type != "baidupan" and output_path.exists()
+        if target_exists or _candidate_media_key(candidate) in completed_media:
+            duplicates.add(index)
+    return duplicates
+
+
+def _filter_duplicate_queue(
+    queue: list[tuple[VideoCandidate, Path]],
+    history_records: list[DownloadRecord],
+) -> tuple[list[tuple[VideoCandidate, Path]], int]:
+    """Remove existing or already completed media while preserving queue order. @codex-comment"""
+
+    duplicate_indices = _duplicate_queue_indices(queue, history_records)
+    return (
+        [item for index, item in enumerate(queue) if index not in duplicate_indices],
+        len(duplicate_indices),
+    )
+
+
 def _available_output_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -1579,10 +2046,16 @@ def _plan_output_paths(
     candidates: list[VideoCandidate],
     output_dir: Path,
     requested_file_name: str,
+    avoid_existing: bool = True,
 ) -> list[tuple[VideoCandidate, Path]]:
+    """Reserve unique file paths while mapping provider-managed directory jobs to their root. @codex-comment"""
+
     reserved: set[Path] = set()
     result: list[tuple[VideoCandidate, Path]] = []
     for candidate in candidates:
+        if candidate.source_type == "baidupan":
+            result.append((candidate, output_dir))
+            continue
         if len(candidates) == 1:
             file_name = sanitize_file_name(requested_file_name, "video")
         else:
@@ -1590,10 +2063,10 @@ def _plan_output_paths(
         if not Path(file_name).suffix:
             file_name += _default_suffix_for_candidate(candidate)
         path = output_dir / file_name
-        if path.exists() or path in reserved:
+        if (avoid_existing and path.exists()) or path in reserved:
             for index in range(1, 1000):
                 alternative = path.with_name(f"{path.stem} ({index}){path.suffix}")
-                if not alternative.exists() and alternative not in reserved:
+                if (not avoid_existing or not alternative.exists()) and alternative not in reserved:
                     path = alternative
                     break
         reserved.add(path)
