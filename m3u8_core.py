@@ -11,12 +11,13 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Iterable, Optional
-from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -280,9 +281,11 @@ class DownloadHistoryStore:
                 payload = json.loads(candidate.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
                 continue
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and isinstance(payload.get("records"), list):
                 break
         records = payload.get("records", []) if isinstance(payload, dict) else []
+        if not isinstance(records, list):
+            records = []
         result: list[DownloadRecord] = []
         for item in records:
             if not isinstance(item, dict):
@@ -296,8 +299,36 @@ class DownloadHistoryStore:
         return sorted(result, key=lambda item: item.updated_at, reverse=True)[: self.limit]
 
     def load(self) -> list[DownloadRecord]:
-        with self._lock:
+        with self._transaction():
             return self._load_unlocked()
+
+    @contextmanager
+    def _transaction(self):
+        """Serialize history transactions across threads and application processes."""
+
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.with_suffix(self.path.suffix + ".lock").open("a+b") as handle:
+                if os.name == "nt":
+                    import msvcrt
+
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _save_unlocked(self, records: Iterable[DownloadRecord]) -> None:
         normalized = [DownloadRecord.from_dict(asdict(item)) for item in records]
@@ -314,11 +345,12 @@ class DownloadHistoryStore:
                 os.fsync(handle.fileno())
             if self.path.exists():
                 try:
-                    json.loads(self.path.read_text(encoding="utf-8"))
+                    previous = json.loads(self.path.read_text(encoding="utf-8"))
                 except (OSError, ValueError, TypeError):
                     pass
                 else:
-                    shutil.copy2(self.path, self.backup_path)
+                    if isinstance(previous, dict) and isinstance(previous.get("records"), list):
+                        shutil.copy2(self.path, self.backup_path)
             temp_path.replace(self.path)
         finally:
             try:
@@ -327,25 +359,25 @@ class DownloadHistoryStore:
                 pass
 
     def save(self, records: Iterable[DownloadRecord]) -> None:
-        with self._lock:
+        with self._transaction():
             self._save_unlocked(records)
 
     def upsert(self, record: DownloadRecord) -> list[DownloadRecord]:
-        with self._lock:
+        with self._transaction():
             records = [item for item in self._load_unlocked() if item.record_id != record.record_id]
             records.insert(0, record)
             self._save_unlocked(records)
             return records[: self.limit]
 
     def clear_completed(self) -> list[DownloadRecord]:
-        with self._lock:
+        with self._transaction():
             records = [item for item in self._load_unlocked() if item.status != "completed"]
             self._save_unlocked(records)
             return records
 
 
 class CoalescingEventBuffer:
-    """Keeps terminal events ordered while collapsing high-frequency UI updates."""
+    """Coalesce progress within lifecycle boundaries without losing a previous item's final state."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -362,6 +394,9 @@ class CoalescingEventBuffer:
             elif event == "segment":
                 self._coalesced[(event, payload.get("index"))] = item
             else:
+                if event != "log":
+                    self._regular.extend(self._coalesced.values())
+                    self._coalesced.clear()
                 self._regular.append(item)
 
     def drain(self) -> list[tuple[str, dict]]:
@@ -1614,9 +1649,23 @@ def candidate_score(candidate: VideoCandidate) -> tuple[int, int, int]:
 
 
 def candidate_identity(candidate: VideoCandidate) -> tuple[str, str, str]:
-    parsed = urlsplit(candidate.url)
-    stable_url = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
+    stable_url = media_identity_url(candidate.url)
     return candidate.source_type, stable_url, candidate.resolution.lower()
+
+
+def media_identity_url(value: str) -> str:
+    """Keep resource selectors for in-memory matching/hashing; never use this value in logs."""
+
+    volatile = {
+        "token", "access_token", "auth", "authorization", "signature", "sig", "sign",
+        "expires", "expiry", "exp", "policy", "key-pair-id", "hmac", "hdnts", "hdnea",
+        "password", "pwd", "passcode", "pass_code", "s_code", "cookie", "api_key",
+    }
+    parsed = urlsplit(value.strip())
+    query = [(key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+             if key.lower() not in volatile and not key.lower().startswith(("x-amz-", "x-goog-"))]
+    base = redact_url(value)
+    return base + ("?" + urlencode(sorted(query)) if query else "")
 
 
 def rank_candidates(candidates: Iterable[VideoCandidate]) -> list[VideoCandidate]:
@@ -2557,7 +2606,7 @@ class DirectDownloadJob:
         self.headers = headers or make_headers(_default_referer(url))
         self.callback = callback
         self.url_refresher = url_refresher
-        self.resume_key = resume_key or redact_url(url)
+        self.resume_key = resume_key or media_identity_url(url)
         self.retries = max(0, min(10, retries))
         self.retry_backoff_seconds = max(0.0, min(10.0, retry_backoff_seconds))
         self.pause_event = threading.Event()
@@ -2566,6 +2615,9 @@ class DirectDownloadJob:
         self.cache_dir = self._cache_root()
         self.lock = threading.Lock()
         self.last_done = 0
+        self.expected_size = 0
+        self.expected_etag_hash = ""
+        self._if_range = ""
 
     def pause(self) -> None:
         self.pause_event.clear()
@@ -2611,6 +2663,7 @@ class DirectDownloadJob:
     def _download(self) -> None:
         resume_path = self._resume_path()
         self._migrate_legacy_part(resume_path)
+        self._load_resume_metadata(resume_path)
         last_error: Optional[Exception] = None
         for attempt in range(self.retries + 1):
             if self.stop_event.is_set():
@@ -2620,6 +2673,7 @@ class DirectDownloadJob:
                 if self.stop_event.is_set():
                     return
                 resume_path.replace(self.output_path)
+                self._metadata_path().unlink(missing_ok=True)
                 self._remove_empty_resume_dirs()
                 return
             except Exception as exc:
@@ -2660,35 +2714,64 @@ class DirectDownloadJob:
         raise last_error or HlsError("直链下载未完成，已保留内部续传缓存。")
 
     def _download_attempt(self, part_path: Path) -> None:
-        """Append validated bounded Range responses until the declared media size is complete. @codex-comment"""
+        """Validate response boundaries before appending, and publish only a nonempty complete object."""
 
         start_at = part_path.stat().st_size if part_path.exists() else 0
         while not self.stop_event.is_set():
+            while not self.pause_event.wait(0.2):
+                if self.stop_event.is_set():
+                    return
+            if self.stop_event.is_set():
+                return
             requested_end = start_at + DIRECT_RANGE_CHUNK_BYTES - 1
             request_headers = dict(self.headers)
             request_headers["Accept-Encoding"] = "identity"
             request_headers["Range"] = f"bytes={start_at}-{requested_end}"
+            if start_at and self._if_range:
+                request_headers["If-Range"] = self._if_range
 
             with _http_session().get(self.url, headers=request_headers, stream=True, timeout=(10, 45)) as response:
                 if response.status_code == 416:
                     total_size = _response_unsatisfied_total(response)
-                    if total_size == start_at:
+                    if total_size > 0 and total_size == start_at and self.expected_size in {0, total_size}:
+                        if self.expected_etag_hash and not response.headers.get("ETag"):
+                            self._confirm_resume_end(total_size)
+                        else:
+                            self._remember_response(response, total_size)
                         return
-                    raise DirectResumeError("服务器拒绝当前断点范围，已保留 .part 文件等待刷新链接。")
+                    raise DirectResumeError("服务器拒绝当前断点范围，已保留内部续传缓存等待刷新链接。")
                 response.raise_for_status()
+                if response.status_code not in {200, 206}:
+                    raise HlsError("服务器没有返回可下载的媒体内容。")
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type in {
+                    "text/html", "application/xhtml+xml", "application/json", "application/problem+json",
+                    "application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl",
+                    "audio/x-mpegurl", "application/dash+xml",
+                }:
+                    raise HlsError("服务器返回了网页、播放列表或接口错误，请重新解析媒体。")
+                if response.headers.get("Content-Encoding", "identity").strip().lower() not in {"", "identity"}:
+                    raise DirectResumeError("服务器返回了压缩数据，无法安全匹配媒体字节范围。")
 
                 bounds = _response_range_bounds(response) if response.status_code == 206 else None
                 if start_at and response.status_code != 206:
-                    raise DirectResumeError("服务器未接受断点续传范围，已保留 .part 文件。")
+                    raise DirectResumeError("服务器未接受断点续传范围，已保留内部续传缓存。")
                 if bounds is not None and bounds[0] != start_at:
-                    raise DirectResumeError("服务器返回的续传范围与本地断点不匹配，已保留 .part 文件。")
+                    raise DirectResumeError("服务器返回的续传范围与本地断点不匹配，已保留内部续传缓存。")
                 if bounds is not None and bounds[1] > requested_end:
                     raise DirectResumeError("服务器返回的数据超过请求范围，拒绝追加到断点文件。")
                 if response.status_code == 206 and bounds is None:
-                    raise DirectResumeError("服务器返回了无效的续传范围，已保留 .part 文件。")
+                    raise DirectResumeError("服务器返回了无效的续传范围，已保留内部续传缓存。")
 
                 mode = "ab" if start_at else "wb"
                 total_size = _response_total_size(response, start_at)
+                if total_size > 0:
+                    if self.expected_size and total_size != self.expected_size:
+                        raise DirectResumeError("媒体总大小在续传过程中发生变化，已保留内部续传缓存。")
+                    if bounds is not None and bounds[1] >= total_size:
+                        raise DirectResumeError("服务器返回的范围超过媒体总大小，已保留内部续传缓存。")
+                self._remember_response(response, total_size)
+                response_end = bounds[1] + 1 if bounds is not None else total_size
                 written = start_at
                 self._emit_download_progress(written, total_size)
 
@@ -2701,6 +2784,12 @@ class DirectDownloadJob:
                             return
                         if not chunk:
                             continue
+                        if written == 0 and chunk.lstrip(b"\xef\xbb\xbf \t\r\n").lower().startswith(
+                            (b"#extm3u", b"<!doctype html", b"<html", b"<mpd", b"<?xml")
+                        ):
+                            raise HlsError("媒体地址返回了网页或播放列表，请重新解析媒体。")
+                        if response_end and written + len(chunk) > response_end:
+                            raise DirectResumeError("服务器返回的数据超过声明范围，拒绝写入多余数据。")
                         handle.write(chunk)
                         written += len(chunk)
                         self._emit_download_progress(written, total_size)
@@ -2710,6 +2799,8 @@ class DirectDownloadJob:
                         f"连接提前结束：响应范围应结束于 {bounds[1]}，实际写入至 {written - 1}"
                     )
                 if response.status_code == 200:
+                    if written == 0:
+                        raise HlsError("服务器返回空文件，未生成视频文件。")
                     if total_size > 0 and written != total_size:
                         raise HlsError(f"连接提前结束：预期 {total_size} 字节，实际 {written} 字节")
                     return
@@ -2757,6 +2848,66 @@ class DirectDownloadJob:
 
     def _resume_path(self) -> Path:
         return self.cache_dir / "payload.cache"
+
+    def _metadata_path(self) -> Path:
+        return self.cache_dir / "metadata.json"
+
+    def _confirm_resume_end(self, total_size: int) -> None:
+        """Validate a complete cache with a one-byte probe when EOF omits its ETag."""
+
+        headers = dict(self.headers)
+        headers.update({"Range": "bytes=0-0", "Accept-Encoding": "identity"})
+        with _http_session().get(self.url, headers=headers, stream=True, timeout=(10, 45)) as response:
+            response.raise_for_status()
+            if response.status_code != 206 or _response_range_bounds(response) != (0, 0):
+                raise DirectResumeError("服务器未能确认完整缓存的文件版本，已保留续传缓存。")
+            if _response_total_size(response, 0) not in {0, total_size}:
+                raise DirectResumeError("媒体总大小在续传过程中发生变化，已保留内部续传缓存。")
+            if response.headers.get("Content-Encoding", "identity").strip().lower() not in {"", "identity"}:
+                raise DirectResumeError("校验请求返回了压缩数据，已保留续传缓存。")
+            self._remember_response(response, total_size)
+            with self._resume_path().open("rb") as cached:
+                first_byte = cached.read(1)
+            if next(response.iter_content(chunk_size=2), b"") != first_byte:
+                raise DirectResumeError("完整缓存与服务器的校验数据不一致，已保留续传缓存。")
+
+    def _load_resume_metadata(self, part_path: Path) -> None:
+        """Restore only size and a hashed strong validator; legacy caches remain resumable."""
+
+        if not part_path.exists() or part_path.stat().st_size == 0 or not self._metadata_path().exists():
+            return
+        try:
+            metadata = json.loads(self._metadata_path().read_text(encoding="utf-8"))
+            size = metadata["size"]
+            etag_hash = metadata["etag_hash"]
+            if type(size) is not int or size < 0 or not isinstance(etag_hash, str):
+                raise ValueError("invalid metadata")
+            if etag_hash and not re.fullmatch(r"[a-f0-9]{64}", etag_hash):
+                raise ValueError("invalid validator")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise DirectResumeError("续传校验信息损坏，已保留缓存，请使用新的保存文件名重新下载。") from exc
+        self.expected_size = size
+        self.expected_etag_hash = etag_hash
+
+    def _remember_response(self, response: requests.Response, total_size: int) -> None:
+        """Persist validators before writing bytes, rejecting changed representations on resume."""
+
+        etag = response.headers.get("ETag", "").strip()
+        strong_etag = etag if re.fullmatch(r'"[^"\r\n]*"', etag) else ""
+        etag_hash = hashlib.sha256(strong_etag.encode("utf-8")).hexdigest() if strong_etag else ""
+        if self.expected_etag_hash and self.expected_etag_hash != etag_hash:
+            raise DirectResumeError("媒体版本已变化或缺少原版本校验标记，已保留缓存，请重新解析并使用新的保存文件名。")
+        size = total_size or self.expected_size
+        if self.expected_size and size != self.expected_size:
+            raise DirectResumeError("媒体总大小在续传过程中发生变化，已保留内部续传缓存。")
+        if (size, etag_hash) != (self.expected_size, self.expected_etag_hash):
+            metadata = {"size": size, "etag_hash": etag_hash}
+            temp = self._metadata_path().with_suffix(".tmp")
+            temp.write_text(json.dumps(metadata), encoding="utf-8")
+            temp.replace(self._metadata_path())
+        self.expected_size = size
+        self.expected_etag_hash = etag_hash
+        self._if_range = strong_etag
 
     def _migrate_legacy_part(self, resume_path: Path) -> None:
         """Move an old visible sidecar into the internal resume cache once. @codex-comment"""

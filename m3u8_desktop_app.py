@@ -37,6 +37,7 @@ from m3u8_core import (
     find_baidupcs_executable,
     load_best_media_playlist,
     make_headers,
+    media_identity_url,
     redact_url,
     refresh_pikpak_candidate,
     sanitize_file_name,
@@ -91,6 +92,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.segment_block_count = 0
         self.segment_items: dict[int, int] = {}
         self.segment_status: dict[int, str] = {}
+        self._dirty_segment_blocks: set[int] = set()
 
         self.last_progress_bytes = 0
         self.last_progress_done = 0
@@ -820,6 +822,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
                                     access_code=share_access_code,
                                     callback=queue_callback,
                                 )
+                                if refreshed.source_type != "pikpak" or refreshed.media_id != current_candidate.media_id:
+                                    raise HlsError("媒体类型或文件标识已变化，请重新解析分享后继续下载。")
                                 return refreshed.url
 
                             url_refresher = refresh_url
@@ -829,7 +833,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
                             headers=headers,
                             callback=queue_callback,
                             url_refresher=url_refresher,
-                            resume_key=candidate.media_id or candidate.source_url,
+                            resume_key=candidate.media_id or _candidate_media_key(candidate),
                         )
                     else:
                         playlist = load_best_media_playlist(candidate.url, headers=headers)
@@ -843,6 +847,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
                             resume_key=_candidate_media_key(candidate),
                         )
                     self.current_job = job
+                    if self.queue_stop_event.is_set():
+                        job.stop()
+                        terminal.update({"event": "stopped", "payload": {}})
+                        break
                     self.event_buffer.put("job_ready", {"job": job})
                     job.run()
                 except Exception as exc:
@@ -1190,7 +1198,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
     def _drain_events(self) -> None:
         for event, payload in self.event_buffer.drain():
+            if event != "segment":
+                self._flush_segment_updates()
             self._handle_event(event, payload)
+        self._flush_segment_updates()
         self.after(UI_REFRESH_INTERVAL_MS, self._drain_events)
 
     def _handle_event(self, event: str, payload: dict) -> None:
@@ -1232,7 +1243,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.status_var.set("浏览器伴侣注册失败")
             self._show_notice("warning", "浏览器伴侣注册失败", str(payload.get("error", "请检查便携包是否完整。")))
         elif event == "job_ready":
-            self.current_job = payload["job"]
+            if payload["job"] is self.current_job:
+                self._set_downloading_state(True)
         elif event == "queue_item_started":
             candidate = payload["candidate"]
             output_path = Path(payload["output"])
@@ -1249,8 +1261,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
         elif event == "queue_item_completed":
             self.queue_completed += 1
             self.progress["value"] = 100
-            self._history_update(status="completed", progress=100.0, force=True)
             output = Path(str(payload.get("output", "")))
+            self._history_update(status="completed", progress=100.0, output_path=output, force=True)
             self._log("已完成：" + output.name)
         elif event == "queue_item_retry":
             attempt = int(payload.get("attempt", 2))
@@ -1448,6 +1460,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.segment_total = max(0, total)
         self.segment_block_count = min(self.segment_total, MAX_SEGMENT_BLOCKS)
         self.segment_status = {}
+        self._dirty_segment_blocks = set()
         self._redraw_segments()
 
     def _redraw_segments(self) -> None:
@@ -1475,13 +1488,20 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.segment_items[block] = rect
 
     def _update_segment(self, index: int, status: str) -> None:
-        if self.segment_total <= 0 or index < 0:
+        if self.segment_total <= 0 or index < 0 or index >= self.segment_total:
             return
         self.segment_status[index] = status
-        block = min(self.segment_block_count - 1, int(index * self.segment_block_count / self.segment_total))
-        item = self.segment_items.get(block)
-        if item:
-            self.segment_canvas.itemconfigure(item, fill=_status_color(self._block_status(block)))
+        block = min(self.segment_block_count - 1, ((index + 1) * self.segment_block_count - 1) // self.segment_total)
+        self._dirty_segment_blocks.add(block)
+
+    def _flush_segment_updates(self) -> None:
+        """Repaint each changed block once per contiguous event batch, not once per segment."""
+
+        for block in self._dirty_segment_blocks:
+            item = self.segment_items.get(block)
+            if item:
+                self.segment_canvas.itemconfigure(item, fill=_status_color(self._block_status(block)))
+        self._dirty_segment_blocks.clear()
 
     def _block_status(self, block: int) -> str:
         start = int(block * self.segment_total / self.segment_block_count)
@@ -1526,6 +1546,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         bytes_done: int | None = None,
         error: UserFacingError | None = None,
         force: bool = False,
+        output_path: Path | None = None,
     ) -> None:
         if not self.current_record_id:
             return
@@ -1539,26 +1560,34 @@ class UniversalVideoDownloaderApp(tk.Tk):
         current = next((item for item in self.history_records if item.record_id == self.current_record_id), None)
         if current is None:
             return
+        completed_bytes = None
+        if status == "completed" and output_path is not None:
+            try:
+                if output_path.is_file():
+                    completed_bytes = output_path.stat().st_size
+            except OSError:
+                pass
         updated = replace(
             current,
             status=status or current.status,
             progress=max(current.progress, self.current_progress_value),
-            bytes_done=max(current.bytes_done, self.current_bytes_done),
+            bytes_done=completed_bytes if completed_bytes is not None else max(current.bytes_done, self.current_bytes_done),
+            output_path=str(output_path) if output_path is not None else current.output_path,
             updated_at=now,
-            error_code=error.code if error else current.error_code,
-            error_message=error.message if error else current.error_message,
+            error_code=error.code if error else ("" if status == "completed" else current.error_code),
+            error_message=error.message if error else ("" if status == "completed" else current.error_message),
         )
         self.history_records = self.history_store.upsert(updated)
         self.last_history_write = now
         self._refresh_history()
 
     def _refresh_history(self) -> None:
-        """Apply search/status filters and refresh task actions for the visible history. @codex-comment"""
+        """Reconcile changed rows while retaining selection, focus, and scroll position. @codex-comment"""
 
         if not hasattr(self, "history_tree"):
             return
-        for item in self.history_tree.get_children():
-            self.history_tree.delete(item)
+        existing = self.history_tree.get_children()
+        previous_rows = getattr(self, "_history_rows", {})
         query = self.history_search.get().strip() if hasattr(self, "history_search") else ""
         if query == "搜索任务或来源":
             query = ""
@@ -1566,22 +1595,33 @@ class UniversalVideoDownloaderApp(tk.Tk):
             record for record in self.history_records if _history_record_matches(record, query, self.history_filter_var.get())
         ]
         self.history_summary_var.set(f"{len(visible_records)} / {len(self.history_records)} 个任务")
+        visible_ids = tuple(record.record_id for record in visible_records)
+        visible_set = set(visible_ids)
+        scroll_position = self.history_tree.yview()[0]
+        for item in existing:
+            if item not in visible_set:
+                self.history_tree.delete(item)
+        rows = {}
+        existing_set = set(existing)
         for record in visible_records:
-            self.history_tree.insert(
-                "",
-                tk.END,
-                iid=record.record_id,
-                tags=(record.status,),
-                values=(
-                    record.title,
-                    _history_type_label(record.source_type),
-                    _history_status_label(record.status),
-                    f"{record.progress:.0f}%",
-                    _format_size(record.bytes_done),
-                    time.strftime("%Y-%m-%d %H:%M", time.localtime(record.updated_at)),
-                    record.output_path,
-                ),
+            values = (
+                record.title,
+                _history_type_label(record.source_type),
+                _history_status_label(record.status),
+                f"{record.progress:.0f}%",
+                _format_size(record.bytes_done),
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(record.updated_at)),
+                record.output_path,
             )
+            rows[record.record_id] = (record.status, values)
+            if record.record_id not in existing_set:
+                self.history_tree.insert("", tk.END, iid=record.record_id, tags=(record.status,), values=values)
+            elif previous_rows.get(record.record_id) != rows[record.record_id]:
+                self.history_tree.item(record.record_id, tags=(record.status,), values=values)
+        if existing != visible_ids:
+            self.history_tree.set_children("", *visible_ids)
+            self.history_tree.yview_moveto(scroll_position)
+        self._history_rows = rows
         self._sync_history_actions()
 
     def _selected_history(self) -> DownloadRecord | None:
@@ -1952,6 +1992,7 @@ def _history_retry_candidate_index(record: DownloadRecord, candidates: list[Vide
         exact = [index for index, candidate in enumerate(candidates) if _candidate_media_key(candidate) == record.media_key]
         if len(exact) == 1:
             return exact[0]
+        return None
 
     title_matches = [
         index
@@ -1961,9 +2002,6 @@ def _history_retry_candidate_index(record: DownloadRecord, candidates: list[Vide
     ]
     if len(title_matches) == 1:
         return title_matches[0]
-    same_type = [index for index, candidate in enumerate(candidates) if candidate.source_type == record.source_type]
-    if len(candidates) == 1 and len(same_type) == 1:
-        return same_type[0]
     return None
 
 
@@ -1975,7 +2013,7 @@ def _candidate_media_key(candidate: VideoCandidate) -> str:
         identity = f"{source_type}|id|{candidate.media_id.strip()}"
     else:
         raw_url = candidate.source_url if source_type == "baidupan" else (candidate.url or candidate.source_url)
-        normalized_url = redact_url(raw_url)
+        normalized_url = media_identity_url(raw_url)
         identity = f"{source_type}|url|{normalized_url}"
         source_url = redact_url(candidate.source_url)
         if candidate.playlist_index and normalized_url == source_url:

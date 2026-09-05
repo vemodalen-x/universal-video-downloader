@@ -2,7 +2,10 @@ from pathlib import Path
 import struct
 import threading
 from types import SimpleNamespace
+from dataclasses import replace
 import zlib
+
+import pytest
 
 import m3u8_desktop_app
 from m3u8_core import CoalescingEventBuffer, DownloadPreferences, DownloadRecord, HlsError, SubtitleTrack, VideoCandidate
@@ -646,7 +649,8 @@ def test_download_queue_stops_remaining_items_after_explicit_stop(monkeypatch, t
     )
 
 
-def test_pikpak_download_uses_resumable_direct_job(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("refreshed_type", ["pikpak", "hls"])
+def test_pikpak_download_uses_resumable_direct_job(monkeypatch, tmp_path, refreshed_type) -> None:
     captured: dict[str, object] = {}
 
     class FakeDirectJob:
@@ -690,13 +694,14 @@ def test_pikpak_download_uses_resumable_direct_job(monkeypatch, tmp_path) -> Non
             candidate.title,
             "https://cdn.example.com/video.mp4?signature=fresh",
             candidate.source_url,
-            source_type="pikpak",
+            source_type=refreshed_type,
             container="mp4",
             media_id=candidate.media_id,
         )
 
     monkeypatch.setattr(m3u8_desktop_app, "DirectDownloadJob", FakeDirectJob)
     monkeypatch.setattr(m3u8_desktop_app, "refresh_pikpak_candidate", fake_refresh)
+    monkeypatch.setattr(m3u8_desktop_app, "BATCH_ITEM_RETRY_BACKOFF_SECONDS", 0)
     app = object.__new__(UniversalVideoDownloaderApp)
     app.event_buffer = CoalescingEventBuffer()
     app.queue_stop_event = threading.Event()
@@ -724,6 +729,10 @@ def test_pikpak_download_uses_resumable_direct_job(monkeypatch, tmp_path) -> Non
     assert captured["output_path"] == tmp_path / "video.mp4"
     assert captured["resume_key"] == candidate.media_id
     assert callable(captured["url_refresher"])
+    if refreshed_type == "hls":
+        assert "refreshed_url" not in captured
+        assert app.event_buffer.drain()[-1][1] == {"completed": 0, "failed": 1, "total": 1, "stopped": False}
+        return
     assert captured["refreshed_url"] == "https://cdn.example.com/video.mp4?signature=fresh"
     assert captured["refresh_candidate"] is candidate
     assert captured["refresh_source_url"] == candidate.source_url
@@ -899,7 +908,8 @@ def test_continue_history_after_analysis_reuses_record_id_and_exact_output(tmp_p
     assert started == [True]
 
 
-def test_continue_history_does_not_start_when_media_cannot_be_matched(tmp_path) -> None:
+@pytest.mark.parametrize("candidate_count", [1, 2])
+def test_continue_history_does_not_start_when_media_cannot_be_matched(tmp_path, candidate_count) -> None:
     record = DownloadRecord(
         record_id="retry-1",
         title="Missing",
@@ -916,7 +926,7 @@ def test_continue_history_does_not_start_when_media_cannot_be_matched(tmp_path) 
     app.candidates = [
         VideoCandidate("First", "https://cdn.example.com/first.m3u8", record.source_url, source_type="hls"),
         VideoCandidate("Second", "https://cdn.example.com/second.m3u8", record.source_url, source_type="hls"),
-    ]
+    ][:candidate_count]
     app.status_var = SimpleNamespace(set=lambda _value: None)
     app._log = lambda *_args: None
     app._show_notice = lambda *args: notices.append(args)
@@ -940,6 +950,175 @@ def test_history_output_settings_keep_baidupan_directory(tmp_path) -> None:
     )
 
     assert _history_output_settings(record) == (tmp_path, "由分享目录决定")
+
+
+def test_media_identity_preserves_query_selectors_but_ignores_signatures():
+    one = VideoCandidate("One", "https://cdn.example.com/video.mp4?id=1&token=first", "https://example.com/watch", source_type="direct")
+    refreshed = replace(one, url="https://cdn.example.com/video.mp4?token=second&id=1")
+    two = replace(one, title="Two", url="https://cdn.example.com/video.mp4?id=2&token=third")
+    assert _candidate_media_key(one) == _candidate_media_key(refreshed)
+    assert _candidate_media_key(one) != _candidate_media_key(two)
+    assert _deduplicate_candidates([one, refreshed, two]) == ([one, two], 1)
+
+
+def test_history_retry_rejects_conflicting_identity_even_with_same_title():
+    original = VideoCandidate("Episode", "https://cdn.example.com/v.mp4?id=1", "https://example.com/watch", source_type="direct")
+    other = replace(original, url="https://cdn.example.com/v.mp4?id=2")
+    record = DownloadRecord("r", "Episode", "direct", original.source_url, "example.com", "video.mp4", "failed", media_key=_candidate_media_key(original))
+    assert _history_retry_candidate_index(record, [other]) is None
+
+
+def test_stale_job_ready_cannot_replace_active_job():
+    latest = object()
+    states = []
+    app = SimpleNamespace(current_job=latest, _set_downloading_state=states.append)
+    UniversalVideoDownloaderApp._handle_event(app, "job_ready", {"job": object()})
+    assert app.current_job is latest
+    assert states == []
+    UniversalVideoDownloaderApp._handle_event(app, "job_ready", {"job": latest})
+    assert states == [True]
+
+
+def test_pause_control_enabled_for_native_active_job():
+    states = {}
+    def button(name):
+        return SimpleNamespace(configure=lambda **values: states.setdefault(name, {}).update(values))
+    app = SimpleNamespace(
+        candidates=[], current_candidate=VideoCandidate("Video", "https://example.com/v.mp4", "https://example.com", source_type="direct"),
+        start_button=button("start"), analyze_button=button("analyze"), pause_button=button("pause"),
+        stop_button=button("stop"), partial_button=button("partial"), _sync_history_actions=lambda: None,
+    )
+    UniversalVideoDownloaderApp._set_downloading_state(app, True)
+    assert states["pause"]["state"] == "normal"
+    app.current_candidate = replace(app.current_candidate, source_type="youtube")
+    UniversalVideoDownloaderApp._set_downloading_state(app, True)
+    assert states["pause"]["state"] == "disabled"
+
+
+def test_stop_during_job_preparation_prevents_run(monkeypatch, tmp_path):
+    stopped = []
+    app = object.__new__(UniversalVideoDownloaderApp)
+    app.queue_stop_event = threading.Event()
+    app.event_buffer = CoalescingEventBuffer()
+    app.current_job = None
+
+    class Job:
+        def __init__(self, *_args, **_kwargs):
+            app.queue_stop_event.set()
+
+        def run(self):
+            pytest.fail("a cancelled prepared job must not run")
+
+        def stop(self):
+            stopped.append(True)
+
+    monkeypatch.setattr(m3u8_desktop_app, "YouTubeDownloadJob", Job)
+    candidate = VideoCandidate("Video", "https://example.com/v", "https://example.com/v", source_type="ytdlp")
+    app._download_worker([(candidate, tmp_path / "v.mp4")], 4, True, DownloadPreferences(), "")
+    assert stopped == [True]
+    assert app.event_buffer.drain()[-1][1]["stopped"] is True
+
+
+def test_completed_history_uses_actual_output_and_clears_failure(tmp_path):
+    output = tmp_path / "video.webm"
+    output.write_bytes(b"complete")
+    record = DownloadRecord("r", "Video", "ytdlp", "https://example.com/v", "example.com", str(tmp_path / "video.mp4"), "failed", bytes_done=900, error_code="network", error_message="old failure")
+    saved = []
+    app = SimpleNamespace(
+        current_record_id="r", current_progress_value=0, current_bytes_done=900,
+        last_history_write=0, history_records=[record],
+        history_store=SimpleNamespace(upsert=lambda row: saved.append(row) or [row]), _refresh_history=lambda: None,
+    )
+    UniversalVideoDownloaderApp._history_update(app, status="completed", progress=100, output_path=output, force=True)
+    assert saved[0].output_path == str(output)
+    assert saved[0].bytes_done == len(b"complete")
+    assert saved[0].error_code == saved[0].error_message == ""
+
+
+def test_segment_batch_repaints_each_block_once():
+    app = object.__new__(UniversalVideoDownloaderApp)
+    app.segment_total = 64000
+    app.segment_block_count = MAX_SEGMENT_BLOCKS
+    app.segment_status = {}
+    app._dirty_segment_blocks = set()
+    app.segment_items = {i: i + 1 for i in range(MAX_SEGMENT_BLOCKS)}
+    painted = []
+    app.segment_canvas = SimpleNamespace(itemconfigure=lambda item, **_kwargs: painted.append(item))
+    for index in range(app.segment_total):
+        app._update_segment(index, "done")
+    app._flush_segment_updates()
+    assert len(painted) == MAX_SEGMENT_BLOCKS
+    assert len(set(painted)) == MAX_SEGMENT_BLOCKS
+    assert all(app._block_status(i) == "done" for i in range(MAX_SEGMENT_BLOCKS))
+    app._flush_segment_updates()
+    assert len(painted) == MAX_SEGMENT_BLOCKS
+
+
+def test_segment_dirty_block_matches_nondivisible_boundaries():
+    app = object.__new__(UniversalVideoDownloaderApp)
+    app.segment_total = 161
+    app.segment_block_count = 160
+    app.segment_status = {}
+    app._dirty_segment_blocks = set()
+    app._update_segment(1, "done")
+    assert app._dirty_segment_blocks == {1}
+    assert app._block_status(1) == "done"
+
+
+def test_history_refresh_updates_rows_in_place():
+    class Tree:
+        def __init__(self):
+            self.rows = {}
+            self.order = []
+            self.selected = "b"
+            self.scroll = 0.4
+            self.mutations = []
+
+        def get_children(self):
+            return tuple(self.order)
+
+        def insert(self, _parent, _index, iid, **values):
+            self.rows[iid] = values
+            self.order.append(iid)
+            self.mutations.append(("insert", iid))
+
+        def item(self, iid, **values):
+            self.rows[iid] = values
+            self.mutations.append(("update", iid))
+
+        def delete(self, iid):
+            self.rows.pop(iid)
+            self.order.remove(iid)
+            if self.selected == iid:
+                self.selected = ""
+            self.mutations.append(("delete", iid))
+
+        def set_children(self, _parent, *ids):
+            self.order = list(ids)
+
+        def yview(self):
+            return (self.scroll, 0.7)
+
+        def yview_moveto(self, value):
+            self.scroll = value
+
+    tree = Tree()
+    a = DownloadRecord("a", "A", "direct", "", "", "video-a.mp4", "downloading")
+    b = replace(a, record_id="b", title="B")
+    app = SimpleNamespace(
+        history_tree=tree, history_records=[a, b], _history_rows={},
+        history_search=SimpleNamespace(get=lambda: ""), history_filter_var=SimpleNamespace(get=lambda: "all"),
+        history_summary_var=SimpleNamespace(set=lambda _value: None), _sync_history_actions=lambda: None,
+    )
+    UniversalVideoDownloaderApp._refresh_history(app)
+    tree.mutations.clear()
+    app.history_records = [replace(a, progress=20), b]
+    UniversalVideoDownloaderApp._refresh_history(app)
+    assert tree.mutations == [("update", "a")]
+    assert tree.selected == "b" and tree.scroll == 0.4
+    tree.mutations.clear()
+    UniversalVideoDownloaderApp._refresh_history(app)
+    assert tree.mutations == []
 
 
 def test_v2_brand_assets_cover_windows_icon_sizes() -> None:

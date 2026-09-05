@@ -14,7 +14,15 @@
 
 ### Improved
 
-- Direct-media continuation now uses validated bounded byte ranges instead of open-ended ranges, allowing recovery from CDNs that require an explicit end offset while retaining zero-byte `200` compatibility.
+- Direct-media continuation now uses validated bounded byte ranges instead of open-ended ranges, allowing recovery from CDNs that require an explicit end offset and complete `200` responses when Range is ignored.
+- Reject empty/nonmedia responses, compressed range bodies, overlong bodies, changing declared lengths, and changed strong ETags before publishing a direct download. Resume metadata stores only size and a hashed ETag across restarts.
+- Preserve resource query selectors in media identity while excluding common signatures, so different videos sharing an endpoint are not silently dropped.
+- History retry requires the recorded media fingerprint when present and never selects an unrelated sole candidate automatically.
+- Restore native queue pause controls, prevent stale job events from replacing the active job, and honor cancellation during job preparation.
+- Keep final progress events ordered between queue items; completion now records the actual output path and byte count and clears resolved errors.
+- Refresh only changed history rows, preserving selection and scroll; batch segment repainting once per changed block.
+- Serialize history transactions across processes and recover structurally invalid JSON from a valid backup without overwriting that backup.
+- Reject PikPak refreshes that change the file identity or media type instead of saving an HLS manifest as a video.
 - Direct-media continuation keeps requesting bounded chunks when a valid `206` response omits the total size, and publishes only after the server explicitly confirms the final byte.
 - Local history now retains up to 2000 recent tasks and can recover from a valid atomic backup if the primary JSON file is interrupted or corrupted.
 - Failed, stopped, and interrupted history records can now re-analyze their privacy-safe source, match the original media, reuse the same task/output identity, and continue from local recovery data.

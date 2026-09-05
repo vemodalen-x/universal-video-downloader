@@ -998,6 +998,232 @@ def test_coalescing_event_buffer_keeps_latest_progress_and_order() -> None:
     assert buffer.drain() == []
 
 
+def test_coalescing_preserves_item_progress_before_next_item() -> None:
+    buffer = CoalescingEventBuffer()
+    buffer.put("queue_item_started", {"index": 1})
+    buffer.put("progress", {"done": 100, "bytes_done": 1000})
+    buffer.put("queue_item_completed", {"index": 1})
+    buffer.put("queue_item_started", {"index": 2})
+    buffer.put("progress", {"done": 5, "bytes_done": 20})
+    events = buffer.drain()
+    assert [event for event, _ in events] == [
+        "queue_item_started", "progress", "queue_item_completed", "queue_item_started", "progress",
+    ]
+    assert events[1][1]["bytes_done"] == 1000
+    assert events[-1][1]["bytes_done"] == 20
+
+
+@pytest.mark.parametrize("invalid", [{"records": None}, {"records": 42}, {"records": {}}, {}])
+def test_history_recovers_structurally_invalid_primary_without_losing_backup(tmp_path, invalid) -> None:
+    store = DownloadHistoryStore(tmp_path / "history.json")
+    valid = {"version": 1, "records": [{"record_id": "saved", "title": "Saved"}]}
+    store.backup_path.write_text(json.dumps(valid), encoding="utf-8")
+    store.path.write_text(json.dumps(invalid), encoding="utf-8")
+    records = store.load()
+    assert [record.record_id for record in records] == ["saved"]
+    store.save(records)
+    assert json.loads(store.backup_path.read_text(encoding="utf-8")) == valid
+
+
+@pytest.fixture
+def scripted_media_server():
+    replies = []
+    connections = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            connections.append(self.client_address)
+            status, headers, body = replies.pop(0) if replies else (500, {}, b"")
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/video.mp4", replies, connections
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("status,headers,body", [
+    (200, {"Content-Type": "text/html; charset=utf-8"}, b"<html>expired</html>"),
+    (200, {"Content-Type": "application/json"}, b'{"error":"expired"}'),
+    (200, {}, b""),
+    (204, {}, b""),
+    (206, {"Content-Range": "bytes 0-3/2"}, b"abcd"),
+    (206, {"Content-Range": "bytes 0-3/8", "Content-Encoding": "gzip"}, b"bad!"),
+    (416, {"Content-Range": "bytes */0"}, b""),
+    (200, {"Content-Type": "application/vnd.apple.mpegurl"}, b"#EXTM3U\n"),
+    (200, {"Content-Type": "text/plain"}, b"#EXTM3U\n"),
+    (200, {}, b"<html>expired</html>"),
+])
+def test_direct_download_rejects_nonmedia_and_invalid_responses(tmp_path, scripted_media_server, status, headers, body):
+    url, replies, _ = scripted_media_server
+    replies.append((status, headers, body))
+    output = tmp_path / "video.mp4"
+    events = []
+    job = DirectDownloadJob(url, output, retries=0, callback=lambda e, p: events.append((e, p)))
+    job.run()
+    assert not output.exists()
+    assert events[-1][0] == "fatal"
+    assert not job._resume_path().exists() or job._resume_path().stat().st_size == 0
+
+
+@pytest.mark.parametrize("second", [
+    (206, {"Content-Range": "bytes 4-7/9"}, b"efgh"),
+    (416, {"Content-Range": "bytes */4"}, b""),
+])
+def test_direct_download_rejects_total_size_changes(tmp_path, scripted_media_server, second):
+    url, replies, _ = scripted_media_server
+    replies.extend([(206, {"Content-Range": "bytes 0-3/8"}, b"abcd"), second])
+    output = tmp_path / "video.mp4"
+    job = DirectDownloadJob(url, output, retries=0)
+    job.run()
+    assert not output.exists()
+    assert job._resume_path().read_bytes() == b"abcd"
+
+
+def test_direct_download_reuses_connection_for_bounded_ranges(tmp_path, scripted_media_server):
+    url, replies, connections = scripted_media_server
+    replies.extend([
+        (206, {"Content-Range": "bytes 0-3/8"}, b"abcd"),
+        (206, {"Content-Range": "bytes 4-7/8"}, b"efgh"),
+    ])
+    output = tmp_path / "video.mp4"
+    DirectDownloadJob(url, output, retries=0).run()
+    assert output.read_bytes() == b"abcdefgh"
+    assert len(connections) == 2
+    assert len(set(connections)) == 1
+
+
+def test_direct_download_does_not_append_overlong_range_body(tmp_path, scripted_media_server):
+    url, replies, _ = scripted_media_server
+    replies.append((206, {"Content-Range": "bytes 4-7/8"}, b"efghEXTRA"))
+    output = tmp_path / "video.mp4"
+    output.with_suffix(".mp4.part").write_bytes(b"abcd")
+    job = DirectDownloadJob(url, output, retries=0)
+    job.run()
+    assert not output.exists()
+    assert job._resume_path().read_bytes() == b"abcd"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_direct_resume_rejects_same_size_changed_etag(tmp_path, scripted_media_server, restart):
+    url, replies, _ = scripted_media_server
+    replies.extend([
+        (206, {"Content-Range": "bytes 0-3/8", "ETag": '"old-version"'}, b"AAAA"),
+        (206, {"Content-Range": "bytes 4-7/8", "ETag": '"new-version"'}, b"BBBB"),
+    ])
+    output = tmp_path / "video.mp4"
+    job = DirectDownloadJob(url, output, retries=0)
+    if restart:
+        job.callback = lambda event, payload: job.stop() if event == "progress" and payload.get("bytes_done", 0) >= 4 else None
+    job.run()
+    if restart:
+        job = DirectDownloadJob(url, output, retries=0)
+        job.run()
+    assert not output.exists()
+    assert job._resume_path().read_bytes() == b"AAAA"
+    metadata = json.loads(job._metadata_path().read_text(encoding="utf-8"))
+    assert metadata["size"] == 8
+    assert "old-version" not in repr(metadata)
+    assert metadata["etag_hash"] == hashlib.sha256(b'"old-version"').hexdigest()
+
+
+def test_direct_resume_accepts_unchanged_validator_after_restart(tmp_path, scripted_media_server):
+    url, replies, _ = scripted_media_server
+    replies.extend([
+        (206, {"Content-Range": "bytes 0-3/8", "ETag": '"same"'}, b"AAAA"),
+        (206, {"Content-Range": "bytes 4-7/8", "ETag": '"same"'}, b"BBBB"),
+    ])
+    output = tmp_path / "video.mp4"
+    job = DirectDownloadJob(url, output, retries=0)
+    job.callback = lambda e, p: job.stop() if e == "progress" and p.get("bytes_done", 0) >= 4 else None
+    job.run()
+    restarted = DirectDownloadJob(url, output, retries=0)
+    restarted.run()
+    assert output.read_bytes() == b"AAAABBBB"
+    assert not restarted.cache_dir.exists()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("probe_etag,completed", [('"same"', True), ('"changed"', False)])
+def test_complete_cache_probes_validator_when_416_omits_etag(tmp_path, scripted_media_server, restart, probe_etag, completed):
+    url, replies, _ = scripted_media_server
+    replies.extend([
+        (206, {"Content-Range": "bytes 0-7/*", "ETag": '"same"'}, b"abcdefgh"),
+        (416, {"Content-Range": "bytes */8"}, b""),
+        (206, {"Content-Range": "bytes 0-0/8", "ETag": probe_etag}, b"a"),
+    ])
+    output = tmp_path / "video.mp4"
+    job = DirectDownloadJob(url, output, retries=0)
+    if restart:
+        job.callback = lambda e, p: job.stop() if e == "progress" and p.get("bytes_done", 0) == 8 else None
+    job.run()
+    if restart:
+        job = DirectDownloadJob(url, output, retries=0)
+        job.run()
+    assert output.exists() == completed
+    if completed:
+        assert output.read_bytes() == b"abcdefgh"
+        assert not job.cache_dir.exists()
+    else:
+        assert job._resume_path().read_bytes() == b"abcdefgh"
+    assert replies == []
+
+
+def test_rank_candidates_keeps_distinct_resource_query_ids():
+    one = VideoCandidate("One", "https://cdn.example.com/video.mp4?id=1&token=old", "https://example.com/watch", source_type="direct")
+    two = replace(one, title="Two", url="https://cdn.example.com/video.mp4?id=2&token=new")
+    assert len(rank_candidates([one, two])) == 2
+
+
+def test_history_updates_from_multiple_store_instances_are_serialized(tmp_path, monkeypatch):
+    first = DownloadHistoryStore(tmp_path / "history.json")
+    second = DownloadHistoryStore(first.path)
+    entered = threading.Event()
+    release = threading.Event()
+    failures = []
+    first_save = first._save_unlocked
+
+    def delayed_save(records):
+        entered.set()
+        assert release.wait(5)
+        first_save(records)
+
+    monkeypatch.setattr(first, "_save_unlocked", delayed_save)
+    record = DownloadRecord("a", "A", "direct", "", "", "a.mp4", "completed")
+    def update(store, row):
+        try:
+            store.upsert(row)
+        except Exception as exc:
+            failures.append(exc)
+
+    a = threading.Thread(target=update, args=(first, record))
+    b = threading.Thread(target=update, args=(second, replace(record, record_id="b")))
+    a.start()
+    assert entered.wait(5)
+    b.start()
+    release.set()
+    a.join(timeout=10)
+    b.join(timeout=10)
+    assert not a.is_alive() and not b.is_alive()
+    assert failures == []
+    assert {row.record_id for row in first.load()} == {"a", "b"}
+
+
 def test_rank_candidates_deduplicates_signed_urls_and_keeps_better_variant() -> None:
     lower = VideoCandidate(
         title="Video",
