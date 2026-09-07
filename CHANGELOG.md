@@ -14,6 +14,12 @@
 
 ### Improved
 
+- Invalidate old media and source-specific credentials when the input link changes; ignore late results and block overlapping analysis/download starts.
+- Add explicit select-all and deselect actions with keyboard support, accurate selection counts, disabled empty-selection downloads, and clear per-title batch naming.
+- Preserve custom filenames across duplicate Tk selection events, including automatic history continuation into the original output path.
+- Move advanced settings to a compact native window; automatically reveal and focus extraction-code recovery, validate concurrency and empty output directories, and disable unsupported settings.
+- Rebalance the desktop layout so download, pause, stop, and progress controls remain visible at the default and minimum window sizes. Add a synthetic native-window smoke command with optional local-only captures.
+
 - Direct-media continuation now uses validated bounded byte ranges instead of open-ended ranges, allowing recovery from CDNs that require an explicit end offset and complete `200` responses when Range is ignored.
 - Reject empty/nonmedia responses, compressed range bodies, overlong bodies, changing declared lengths, and changed strong ETags before publishing a direct download. Resume metadata stores only size and a hashed ETag across restarts.
 - Preserve resource query selectors in media identity while excluding common signatures, so different videos sharing an endpoint are not silently dropped.

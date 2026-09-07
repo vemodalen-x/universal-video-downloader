@@ -4,6 +4,8 @@ import threading
 from types import SimpleNamespace
 from dataclasses import replace
 import zlib
+import tkinter as tk
+from unittest.mock import patch
 
 import pytest
 
@@ -36,6 +38,248 @@ from m3u8_desktop_app import (
     _share_access_code_from_url,
     _subtitle_choice_map,
 )
+
+
+@pytest.fixture(scope="module")
+def _desktop_window(tmp_path_factory):
+    history_path = tmp_path_factory.mktemp("desktop-ui") / "history.json"
+    # A desktop session owns one Tcl interpreter; reset its state between cases.
+    with (
+        patch.object(m3u8_desktop_app, "default_history_path", lambda: history_path),
+        patch.object(m3u8_desktop_app, "BrowserInbox", lambda: object()),
+        patch.object(UniversalVideoDownloaderApp, "_poll_browser_inbox", lambda self: None),
+    ):
+        try:
+            app = UniversalVideoDownloaderApp()
+        except tk.TclError as exc:
+            if "display" in str(exc).lower():
+                pytest.skip("Native UI tests require a display")
+            raise
+        app.withdraw()
+        yield app
+        app.destroy()
+
+
+@pytest.fixture
+def desktop_ui(_desktop_window, tmp_path):
+    app = _desktop_window
+    app.is_downloading = False
+    app.is_analyzing = False
+    app.current_candidate = None
+    app.current_job = None
+    app.current_record_id = ""
+    app.pending_history_retry = None
+    app.history_retry_record_id = ""
+    app._analysis_url = ""
+    app.url_var.set("")
+    app._clear_candidates()
+    app._sync_input_controls()
+    app._set_advanced_visible(False)
+    app.access_code_var.set("")
+    app.referer_var.set("")
+    app.concurrency_var.set("8")
+    app.advanced_error_var.set("")
+    app.event_buffer.drain()
+    callback_errors = []
+    app.report_callback_exception = lambda *args: callback_errors.append(args)
+    app.output_dir_var.set(str(tmp_path / "output"))
+    yield app
+    app.update()
+    assert not callback_errors
+
+
+def _render_demo_candidates(app, count=3, source_type="direct"):
+    app.url_var.set("https://example.com/collection")
+    app._analysis_url = app.url_var.get()
+    app._on_analysis_done([
+        VideoCandidate(f"Episode {i:03}", f"https://example.com/{i}.mp4", app.url_var.get(),
+                       source_type=source_type, playlist_count=count)
+        for i in range(count)
+    ])
+    app.update()
+
+
+def test_source_change_clears_stale_media_and_source_credentials(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.access_code_var.set("demo-only")
+    app.referer_var.set("https://example.com/old-page")
+    app.pending_history_retry = object()
+    app.url_var.set("https://example.com/new-collection")
+    app.update()
+    assert not app.candidates
+    assert not app.analyzed_url
+    assert not app.pending_history_retry
+    assert not app.access_code_var.get()
+    assert not app.referer_var.get()
+    assert app.start_button.instate(["disabled"])
+    assert not app.candidate_tree.get_children()
+
+
+def test_source_whitespace_does_not_reset_ready_selection(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.url_var.set("  " + app.url_var.get() + "  ")
+    assert len(app.candidates) == 3
+    assert not app.start_button.instate(["disabled"])
+
+
+@pytest.mark.parametrize("event", ["analysis_done", "analysis_error"])
+def test_changed_source_discards_late_analysis_events(desktop_ui, event):
+    app = desktop_ui
+    app.url_var.set("https://example.com/old")
+    app._analysis_url = app.url_var.get()
+    app._set_busy_analyzing(True)
+    app.url_var.set("https://example.com/new")
+    candidate = VideoCandidate("Old", "https://example.com/old.mp4", "https://example.com/old")
+    app._handle_event(event, {"candidates": [candidate], "error": HlsError("PikPak 需要提取码")})
+    assert not app.is_analyzing
+    assert not app.candidates
+    assert app.start_button.instate(["disabled"])
+    assert not app.advanced_visible
+
+
+@pytest.mark.parametrize("busy_state", ["is_analyzing", "is_downloading"])
+def test_busy_shortcuts_cannot_start_overlapping_workers(desktop_ui, monkeypatch, busy_state):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    setattr(app, busy_state, True)
+    app._sync_input_controls()
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kwargs: pytest.fail("overlapping worker"))
+    app._start_analyze()
+    app._start_download()
+    app._paste_url()
+    app._clear_url()
+    assert len(app.candidates) == 3
+    assert app.url_entry.instate(["disabled"])
+    assert app.paste_button.instate(["disabled"])
+    assert app.output_dir_entry.instate(["disabled"])
+    assert str(app.candidate_tree.cget("selectmode")) == "none"
+
+
+def test_batch_selection_and_empty_selection_controls(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app, count=125)
+    assert app._select_all_candidates() == "break"
+    assert len(app._selected_candidates()) == 125
+    assert "125 / 125" in app.selection_var.get()
+    assert app.file_name_var.get() == "按各条目标题命名"
+    assert app.file_name_entry.instate(["disabled"])
+    assert app._deselect_candidates() == "break"
+    assert app.start_button.instate(["disabled"])
+    assert app.deselect_button.instate(["disabled"])
+    assert "0 / 125" in app.selection_var.get()
+    assert not app.format_tree.get_children()
+
+
+def test_repeated_selection_event_preserves_custom_filename(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.file_name_var.set("custom-output.mp4")
+    app.candidate_tree.event_generate("<<TreeviewSelect>>")
+    app.update()
+    assert app.file_name_var.get() == "custom-output.mp4"
+    app.candidate_tree.selection_set("1")
+    app.update()
+    assert app.file_name_var.get() == "Episode 001.mp4"
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "0", "33", "1.5", "-1"])
+def test_invalid_concurrency_is_recoverable_without_starting_worker(desktop_ui, monkeypatch, value):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.concurrency_var.set(value)
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kwargs: pytest.fail("invalid worker"))
+    app._start_download()
+    assert not app.is_downloading
+    assert app.advanced_visible
+    assert "1 到 32" in app.advanced_error_var.get()
+    assert not Path(app.output_dir_var.get()).exists()
+
+
+@pytest.mark.parametrize("value", ["1", "8", "32"])
+def test_valid_concurrency_boundaries(desktop_ui, value):
+    desktop_ui.concurrency_var.set(value)
+    assert desktop_ui._validated_concurrency() == int(value)
+
+
+@pytest.mark.parametrize("error", ["PikPak 需要提取码", "PikPak 提取码错误", "百度网盘分享需要提取码", "百度网盘提取码错误"])
+def test_share_code_error_opens_recovery_input(desktop_ui, monkeypatch, error):
+    app = desktop_ui
+    app.url_var.set("https://example.com/share")
+    app._analysis_url = app.url_var.get()
+    app._set_busy_analyzing(True)
+    app.access_code_var.set("demo-only")
+    focused = []
+    monkeypatch.setattr(app.access_code_entry, "focus_set", lambda: focused.append(True))
+    app._handle_event("analysis_error", {"error": HlsError(error)})
+    app.update()
+    assert app.advanced_visible
+    assert focused
+    assert not app.access_code_var.get()
+    assert not app.access_code_entry.instate(["disabled"])
+
+
+def test_history_recovery_keeps_exact_filename_after_tk_selection_event(desktop_ui, monkeypatch, tmp_path):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    candidate = app.candidates[1]
+    output = tmp_path / "original" / "custom-name.mp4"
+    app.pending_history_retry = DownloadRecord(
+        record_id="retry-demo", title=candidate.title, source_type=candidate.source_type,
+        source_url=candidate.source_url, source_host="example.com", output_path=str(output),
+        status="failed", media_key=_candidate_media_key(candidate),
+    )
+    started = []
+    monkeypatch.setattr(app, "_start_download", lambda: started.append(app.file_name_var.get()))
+    app._continue_history_after_analysis()
+    app.update()
+    assert started == [output.name]
+    assert app.file_name_var.get() == output.name
+    assert app.history_retry_record_id == "retry-demo"
+
+
+def test_output_directory_cannot_be_empty(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.output_dir_var.set("   ")
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kwargs: pytest.fail("empty directory worker"))
+    app._start_download()
+    assert not app.is_downloading
+    assert app.notice_title.cget("text") == "请选择保存目录"
+
+
+def test_failed_analysis_clears_loading_placeholder(desktop_ui):
+    app = desktop_ui
+    app.url_var.set("https://example.com/video")
+    app._analysis_url = app.url_var.get()
+    app._set_busy_analyzing(True)
+    app._clear_candidates()
+    app._handle_event("analysis_error", {"error": HlsError("network timeout")})
+    assert not app.is_analyzing
+    assert app.candidate_empty_label.cget("text") == "暂无媒体"
+    assert app.candidate_count_var.get() == "解析未完成"
+    assert "正在" not in app.progress_detail_var.get()
+
+
+def test_share_code_recovery_error_clears_after_success_or_source_change(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.advanced_error_var.set("old error")
+    app._on_analysis_done(list(app.candidates))
+    assert not app.advanced_error_var.get()
+    app.advanced_error_var.set("old error")
+    app.url_var.set("https://example.com/new")
+    assert not app.advanced_error_var.get()
+
+
+@pytest.mark.parametrize("url", ["https://[broken", "not a url", "file:///demo.mp4"])
+def test_malformed_url_shows_inline_validation(desktop_ui, url):
+    app = desktop_ui
+    app.url_var.set(url)
+    app._start_analyze()
+    assert not app.is_analyzing
+    assert app.notice_title.cget("text") == "链接格式不正确"
 
 
 def test_ui_refresh_budget_and_segment_cap() -> None:
@@ -182,6 +426,11 @@ def test_start_download_does_not_create_worker_when_filename_exists(monkeypatch,
     logs: list[str] = []
     app = object.__new__(UniversalVideoDownloaderApp)
     app._selected_candidates = lambda: [candidate]
+    app.is_analyzing = False
+    app.is_downloading = False
+    app.analyzed_url = candidate.source_url
+    app.url_var = SimpleNamespace(get=lambda: candidate.source_url)
+    app._validated_concurrency = lambda: 8
     app.output_dir_var = SimpleNamespace(get=lambda: str(tmp_path))
     app.file_name_var = SimpleNamespace(get=lambda: "video.mp4")
     app.history_records = []
@@ -987,6 +1236,7 @@ def test_pause_control_enabled_for_native_active_job():
         candidates=[], current_candidate=VideoCandidate("Video", "https://example.com/v.mp4", "https://example.com", source_type="direct"),
         start_button=button("start"), analyze_button=button("analyze"), pause_button=button("pause"),
         stop_button=button("stop"), partial_button=button("partial"), _sync_history_actions=lambda: None,
+        _sync_input_controls=lambda: None,
     )
     UniversalVideoDownloaderApp._set_downloading_state(app, True)
     assert states["pause"]["state"] == "normal"

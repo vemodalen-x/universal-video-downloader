@@ -81,6 +81,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.is_downloading = False
         self.is_analyzing = False
         self.advanced_visible = False
+        self._input_url = ""
+        self._analysis_url = ""
+        self.analyzed_url = ""
+        self._selection_ids: tuple[str, ...] = ()
 
         self.history_store = DownloadHistoryStore(default_history_path())
         self.history_records = self._load_history()
@@ -106,7 +110,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.access_code_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(default_dir))
         self.file_name_var = tk.StringVar(value="video.mp4")
-        self.concurrency_var = tk.IntVar(value=8)
+        self.concurrency_var = tk.StringVar(value="8")
         self.keep_cache_var = tk.BooleanVar(value=True)
         self.quality_var = tk.StringVar(value="最佳质量")
         self.subtitle_var = tk.StringVar(value="不下载字幕")
@@ -123,6 +127,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
         self._configure_style()
         self._build_ui()
+        self.url_var.trace_add("write", self._on_source_changed)
+        self._sync_input_controls()
         self._refresh_history()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<Control-l>", self._focus_url)
@@ -156,11 +162,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("clam")
 
-        style.configure(".", font=("Segoe UI", 10))
+        style.configure(".", font=("Microsoft YaHei UI", 10))
         style.configure("App.TFrame", background="#F3F4F6")
         style.configure("Surface.TFrame", background="#FFFFFF")
         style.configure("Header.TFrame", background="#111827")
-        style.configure("HeaderTitle.TLabel", background="#111827", foreground="#FFFFFF", font=("Segoe UI", 16, "bold"))
+        style.configure("HeaderTitle.TLabel", background="#111827", foreground="#FFFFFF", font=("Microsoft YaHei UI", 16, "bold"))
         style.configure("HeaderText.TLabel", background="#111827", foreground="#AEB8C8", font=("Microsoft YaHei UI", 9))
         style.configure("Section.TLabel", background="#FFFFFF", foreground="#15171A", font=("Microsoft YaHei UI", 11, "bold"))
         style.configure("Body.TLabel", background="#FFFFFF", foreground="#24262A", font=("Microsoft YaHei UI", 10))
@@ -179,7 +185,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
             bordercolor="#D5D9E0",
             lightcolor="#D5D9E0",
             darkcolor="#D5D9E0",
-            padding=(10, 8),
+            padding=(10, 5),
         )
         style.map("TEntry", bordercolor=[("focus", "#1677FF")])
         style.configure(
@@ -200,13 +206,13 @@ class UniversalVideoDownloaderApp(tk.Tk):
         style.map("Danger.TButton", background=[("active", "#CD3D42"), ("disabled", "#F0B8BA")], foreground=[("disabled", "#FFFFFF")])
         style.configure("Link.TButton", padding=(4, 3), background="#FFFFFF", foreground="#1677FF", borderwidth=0)
         style.map("Link.TButton", background=[("active", "#FFFFFF")], foreground=[("active", "#0F68E0")])
-        style.configure("Compact.TButton", padding=(8, 6), background="#FFFFFF", foreground="#24262A", borderwidth=1, relief="flat")
+        style.configure("Compact.TButton", padding=(8, 4), background="#FFFFFF", foreground="#24262A", borderwidth=1, relief="flat")
         style.map("Compact.TButton", background=[("active", "#F3F5F8"), ("disabled", "#F5F6F8")], foreground=[("disabled", "#A5ABB4")])
         style.configure("CompactDanger.TButton", padding=(8, 6), background="#E5484D", foreground="#FFFFFF", borderwidth=0)
         style.map("CompactDanger.TButton", background=[("active", "#CD3D42"), ("disabled", "#F0B8BA")], foreground=[("disabled", "#FFFFFF")])
 
         style.configure("TNotebook", background="#F3F4F6", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(18, 9), background="#E6E9EE", foreground="#5F6672", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(18, 6), background="#E6E9EE", foreground="#5F6672", borderwidth=0)
         style.map("TNotebook.Tab", background=[("selected", "#FFFFFF")], foreground=[("selected", "#17191C")])
         style.configure("Treeview", rowheight=36, background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#25272B", borderwidth=0)
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"), background="#F5F6F8", foreground="#687080", relief="flat")
@@ -215,7 +221,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         style.configure("Horizontal.TProgressbar", background="#1677FF", troughcolor="#E7EAF0", bordercolor="#E7EAF0", lightcolor="#1677FF", darkcolor="#1677FF")
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self, style="Header.TFrame", padding=(22, 10))
+        header = ttk.Frame(self, style="Header.TFrame", padding=(22, 8))
         header.pack(fill=tk.X)
 
         self.logo_image = None
@@ -238,7 +244,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         ttk.Label(header, text=capability_text, style="Badge.TLabel").pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Label(header, text="HLS  /  HTTP  /  yt-dlp", style="Badge.TLabel").pack(side=tk.RIGHT)
 
-        shell = ttk.Frame(self, style="App.TFrame", padding=(18, 12, 18, 16))
+        shell = ttk.Frame(self, style="App.TFrame", padding=(18, 8, 18, 10))
         shell.pack(fill=tk.BOTH, expand=True)
         self.main_notebook = ttk.Notebook(shell)
         self.main_notebook.pack(fill=tk.BOTH, expand=True)
@@ -257,7 +263,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         tab.rowconfigure(1, weight=1, minsize=216)
         tab.rowconfigure(2, weight=0, minsize=128)
 
-        source = ttk.Frame(tab, style="Surface.TFrame", padding=14)
+        source = ttk.Frame(tab, style="Surface.TFrame", padding=12)
         source.grid(row=0, column=0, sticky=tk.EW)
         source.columnconfigure(0, weight=1)
 
@@ -272,45 +278,58 @@ class UniversalVideoDownloaderApp(tk.Tk):
             command=self._start_browser_companion_setup,
         )
         self.companion_button.grid(row=0, column=1, sticky=tk.E, padx=(0, 14))
-        self.advanced_button = ttk.Button(title_row, text="显示高级选项", style="Link.TButton", command=self._toggle_advanced)
+        self.advanced_button = ttk.Button(title_row, text="高级选项", style="Link.TButton", command=self._toggle_advanced)
         self.advanced_button.grid(row=0, column=2, sticky=tk.E)
 
-        ttk.Label(source, text="粘贴网页、百度网盘、PikPak、M3U8、HTTP 直链或 YouTube 地址，下载器会自动选择处理方式。", style="Muted.TLabel").grid(
-            row=1, column=0, columnspan=3, sticky=tk.W, pady=(6, 0)
-        )
         self.url_entry = ttk.Entry(source, textvariable=self.url_var)
         self.url_entry.grid(row=2, column=0, sticky=tk.EW, pady=(12, 0), padx=(0, 8))
         self.url_entry.bind("<Return>", lambda _event: self._start_analyze())
         self.url_entry.bind("<Escape>", lambda _event: self._clear_url())
-        ttk.Button(source, text="粘贴", command=self._paste_url).grid(row=2, column=1, pady=(12, 0), padx=(0, 8))
-        ttk.Button(source, text="清空", style="Compact.TButton", command=self._clear_url).grid(row=2, column=2, pady=(12, 0), padx=(0, 8))
+        self.paste_button = ttk.Button(source, text="粘贴", width=5, command=self._paste_url)
+        self.paste_button.grid(row=2, column=1, pady=(12, 0), padx=(0, 8))
+        self.clear_button = ttk.Button(source, text="清空", width=5, style="Compact.TButton", command=self._clear_url)
+        self.clear_button.grid(row=2, column=2, pady=(12, 0), padx=(0, 8))
         self.analyze_button = ttk.Button(source, text="解析媒体", style="Primary.TButton", command=self._start_analyze)
         self.analyze_button.grid(row=2, column=3, pady=(12, 0))
 
         self.notice_frame = tk.Frame(source, bg="#E9F2FF", highlightthickness=0)
-        self.notice_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(12, 0))
+        self.notice_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(8, 0))
         self.notice_frame.columnconfigure(1, weight=1)
         self.notice_title = tk.Label(self.notice_frame, text="", bg="#E9F2FF", fg="#1559A6", font=("Microsoft YaHei UI", 9, "bold"), anchor=tk.W)
-        self.notice_title.grid(row=0, column=0, sticky=tk.W, padx=(12, 8), pady=9)
+        self.notice_title.grid(row=0, column=0, sticky=tk.W, padx=(12, 8), pady=6)
         self.notice_text = tk.Label(self.notice_frame, text="", bg="#E9F2FF", fg="#3E628D", font=("Microsoft YaHei UI", 9), anchor=tk.W, justify=tk.LEFT, wraplength=900)
-        self.notice_text.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12), pady=9)
+        self.notice_text.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12), pady=6)
+        self.notice_text.configure(width=1)
+        self.notice_frame.bind("<Configure>", lambda event: self.notice_text.configure(
+            wraplength=max(180, event.width - self.notice_title.winfo_reqwidth() - 40)
+        ))
         self.notice_frame.grid_remove()
 
-        self.advanced_frame = ttk.Frame(source, style="Surface.TFrame")
-        self.advanced_frame.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(12, 0))
+        self.advanced_window = tk.Toplevel(self)
+        self.advanced_window.withdraw()
+        self.advanced_window.title("高级下载设置")
+        self.advanced_window.transient(self)
+        self.advanced_window.resizable(False, False)
+        self.advanced_window.protocol("WM_DELETE_WINDOW", self._toggle_advanced)
+        self.advanced_window.bind("<Escape>", lambda _event: self._toggle_advanced())
+        self.advanced_frame = ttk.Frame(self.advanced_window, style="Surface.TFrame", padding=18)
+        self.advanced_frame.pack(fill=tk.BOTH, expand=True)
         self.advanced_frame.columnconfigure(1, weight=1)
         ttk.Label(self.advanced_frame, text="Referer", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        ttk.Entry(self.advanced_frame, textvariable=self.referer_var).grid(row=0, column=1, sticky=tk.EW, padx=(0, 16))
+        self.referer_entry = ttk.Entry(self.advanced_frame, textvariable=self.referer_var, width=30)
+        self.referer_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 16))
         ttk.Label(self.advanced_frame, text="并发", style="Muted.TLabel").grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
-        ttk.Spinbox(self.advanced_frame, from_=1, to=32, textvariable=self.concurrency_var, width=7).grid(row=0, column=3, sticky=tk.W, padx=(0, 16))
-        ttk.Checkbutton(self.advanced_frame, text="保留续传缓存", variable=self.keep_cache_var).grid(row=0, column=4, sticky=tk.W)
+        self.concurrency_entry = ttk.Spinbox(self.advanced_frame, from_=1, to=32, textvariable=self.concurrency_var, width=7)
+        self.concurrency_entry.grid(row=0, column=3, sticky=tk.W, padx=(0, 16))
+        self.keep_cache_check = ttk.Checkbutton(self.advanced_frame, text="保留续传缓存", variable=self.keep_cache_var)
+        self.keep_cache_check.grid(row=0, column=4, sticky=tk.W)
         ttk.Label(self.advanced_frame, text="网盘提取码", style="Muted.TLabel").grid(
             row=1, column=0, sticky=tk.W, padx=(0, 8), pady=(10, 0)
         )
-        ttk.Entry(self.advanced_frame, textvariable=self.access_code_var, show="*", width=20).grid(
-            row=1, column=1, sticky=tk.W, padx=(0, 16), pady=(10, 0)
-        )
-        ttk.Label(self.advanced_frame, text="仅在本次下载的进程内使用，队列结束后清空", style="Muted.TLabel").grid(
+        self.access_code_entry = ttk.Entry(self.advanced_frame, textvariable=self.access_code_var, show="*", width=20)
+        self.access_code_entry.grid(row=1, column=1, sticky=tk.W, padx=(0, 16), pady=(10, 0))
+        self.access_code_entry.bind("<Return>", self._shortcut_analyze)
+        ttk.Label(self.advanced_frame, text="仅本次有效", style="Muted.TLabel").grid(
             row=1, column=2, columnspan=2, sticky=tk.W, pady=(10, 0)
         )
         self.baidupan_button = ttk.Button(
@@ -319,7 +338,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
             command=self._start_baidupan_login,
         )
         self.baidupan_button.grid(row=1, column=4, sticky=tk.E, pady=(10, 0))
-        self.advanced_frame.grid_remove()
+        self.advanced_done_button = ttk.Button(self.advanced_frame, text="完成", command=self._toggle_advanced)
+        self.advanced_done_button.grid(row=2, column=4, sticky=tk.E, pady=(14, 0))
+        self.advanced_error_var = tk.StringVar()
+        ttk.Label(self.advanced_frame, textvariable=self.advanced_error_var, style="Muted.TLabel", foreground="#B4232A", wraplength=420).grid(
+            row=2, column=0, columnspan=4, sticky=tk.W, pady=(14, 0)
+        )
 
         workspace = ttk.Frame(tab, style="App.TFrame")
         workspace.grid(row=1, column=0, sticky=tk.NSEW, pady=(10, 0))
@@ -337,8 +361,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
         heading.columnconfigure(0, weight=1)
         ttk.Label(heading, text="可下载媒体", style="Section.TLabel").grid(row=0, column=0, sticky=tk.W)
         ttk.Label(heading, textvariable=self.candidate_count_var, style="Count.TLabel").grid(row=0, column=1, sticky=tk.E, padx=(8, 14))
-        self.best_button = ttk.Button(heading, text="选择推荐项", command=self._select_best_candidate, state=tk.DISABLED)
+        self.best_button = ttk.Button(heading, text="推荐项", width=7, style="Link.TButton", command=self._select_best_candidate, state=tk.DISABLED)
         self.best_button.grid(row=0, column=2, sticky=tk.E)
+        self.select_all_button = ttk.Button(heading, text="全选", width=4, style="Link.TButton", command=self._select_all_candidates, state=tk.DISABLED)
+        self.select_all_button.grid(row=0, column=3, padx=(8, 0))
+        self.deselect_button = ttk.Button(heading, text="取消选择", width=8, style="Link.TButton", command=self._deselect_candidates, state=tk.DISABLED)
+        self.deselect_button.grid(row=0, column=4, padx=(8, 0))
         ttk.Label(candidates_frame, textvariable=self.selection_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(7, 10))
 
         columns = ("title", "quality", "format", "duration", "origin")
@@ -359,15 +387,17 @@ class UniversalVideoDownloaderApp(tk.Tk):
         tree_scroll.grid(row=2, column=1, sticky=tk.NS)
         self.candidate_empty_label = ttk.Label(
             candidates_frame,
-            text="输入链接后，候选版本会显示在这里\n支持网页、M3U8、HTTP 直链和 YouTube",
+            text="暂无媒体",
             style="Body.TLabel",
             anchor=tk.CENTER,
             justify=tk.CENTER,
         )
         self.candidate_empty_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_selection())
+        self.candidate_tree.bind("<Control-a>", self._select_all_candidates)
+        self.candidate_tree.bind("<Escape>", self._deselect_candidates)
 
-        action = ttk.Frame(workspace, style="Surface.TFrame", padding=12)
+        action = ttk.Frame(workspace, style="Surface.TFrame", padding=8)
         action.grid(row=0, column=1, sticky=tk.NSEW)
         action.columnconfigure(0, weight=1)
         action_heading = ttk.Frame(action, style="Surface.TFrame")
@@ -380,14 +410,17 @@ class UniversalVideoDownloaderApp(tk.Tk):
         output_row.grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
         output_row.columnconfigure(1, weight=1)
         ttk.Label(output_row, text="目录", style="Muted.TLabel", width=5).grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(output_row, textvariable=self.output_dir_var).grid(row=0, column=1, sticky=tk.EW, padx=(0, 7))
-        ttk.Button(output_row, text="选择", command=self._choose_output_dir).grid(row=0, column=2)
+        self.output_dir_entry = ttk.Entry(output_row, textvariable=self.output_dir_var)
+        self.output_dir_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 7))
+        self.output_dir_button = ttk.Button(output_row, text="选择", command=self._choose_output_dir)
+        self.output_dir_button.grid(row=0, column=2)
 
         file_row = ttk.Frame(action, style="Surface.TFrame")
         file_row.grid(row=2, column=0, sticky=tk.EW, pady=(3, 0))
         file_row.columnconfigure(1, weight=1)
         ttk.Label(file_row, text="文件", style="Muted.TLabel", width=5).grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(file_row, textvariable=self.file_name_var).grid(row=0, column=1, sticky=tk.EW)
+        self.file_name_entry = ttk.Entry(file_row, textvariable=self.file_name_var, state=tk.DISABLED)
+        self.file_name_entry.grid(row=0, column=1, sticky=tk.EW)
 
         quality_row = ttk.Frame(action, style="Surface.TFrame")
         quality_row.grid(row=3, column=0, sticky=tk.EW, pady=(4, 0))
@@ -408,13 +441,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.subtitle_combo = ttk.Combobox(subtitle_row, textvariable=self.subtitle_var, values=("不下载字幕",), state="readonly")
         self.subtitle_combo.grid(row=0, column=1, sticky=tk.EW, padx=(0, 6))
         self.subtitle_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_subtitle_selected())
-        ttk.Combobox(
+        self.subtitle_format_combo = ttk.Combobox(
             subtitle_row,
             textvariable=self.subtitle_format_var,
             values=("srt", "vtt", "ass"),
             state="readonly",
             width=5,
-        ).grid(row=0, column=2)
+        )
+        self.subtitle_format_combo.grid(row=0, column=2)
 
         subtitle_options = ttk.Frame(action, style="Surface.TFrame")
         subtitle_options.grid(row=5, column=0, sticky=tk.EW, pady=(2, 0))
@@ -443,9 +477,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.partial_button.grid(row=0, column=2, sticky=tk.EW, padx=(6, 0))
         self.partial_button.grid_remove()
 
-        activity = ttk.Notebook(tab)
+        activity = ttk.Notebook(tab, height=96)
         activity.grid(row=2, column=0, sticky=tk.NSEW, pady=(10, 0))
-        progress_tab = ttk.Frame(activity, style="Surface.TFrame", padding=12)
+        progress_tab = ttk.Frame(activity, style="Surface.TFrame", padding=8)
         log_tab = ttk.Frame(activity, style="Surface.TFrame", padding=12)
         format_tab = ttk.Frame(activity, style="Surface.TFrame", padding=12)
         activity.add(progress_tab, text="任务进度")
@@ -455,9 +489,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         progress_tab.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(progress_tab, mode="determinate", maximum=100)
         self.progress.grid(row=0, column=0, sticky=tk.EW)
-        ttk.Label(progress_tab, textvariable=self.progress_detail_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(progress_tab, textvariable=self.progress_detail_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
         self.segment_canvas = tk.Canvas(progress_tab, height=34, bg="#FFFFFF", highlightthickness=0)
-        self.segment_canvas.grid(row=2, column=0, sticky=tk.EW, pady=(8, 0))
+        self.segment_canvas.grid(row=2, column=0, sticky=tk.EW, pady=(4, 0))
         self.segment_canvas.bind("<Configure>", lambda _event: self._redraw_segments())
 
         log_tab.columnconfigure(0, weight=1)
@@ -488,6 +522,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.format_tree.configure(yscrollcommand=format_scroll.set)
         self.format_tree.grid(row=0, column=0, sticky=tk.NSEW)
         format_scroll.grid(row=0, column=1, sticky=tk.NS)
+        self._input_controls = (
+            self.url_entry, self.paste_button, self.clear_button, self.referer_entry,
+            self.access_code_entry, self.concurrency_entry, self.keep_cache_check,
+            self.output_dir_entry, self.output_dir_button,
+        )
 
     def _build_history_tab(self) -> None:
         tab = self.history_tab
@@ -565,15 +604,62 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.history_tree.tag_configure(status, foreground=color)
 
     def _toggle_advanced(self) -> None:
-        self.advanced_visible = not self.advanced_visible
-        if self.advanced_visible:
-            self.advanced_frame.grid()
-            self.advanced_button.configure(text="隐藏高级选项")
+        self._set_advanced_visible(not self.advanced_visible)
+
+    def _set_advanced_visible(self, visible: bool) -> None:
+        self.advanced_visible = visible
+        if visible:
+            self.advanced_window.geometry(f"+{max(0, self.winfo_rootx() + 40)}+{max(0, self.winfo_rooty() + 100)}")
+            self.advanced_window.deiconify()
+            self.advanced_window.lift()
         else:
-            self.advanced_frame.grid_remove()
-            self.advanced_button.configure(text="显示高级选项")
+            self.advanced_window.withdraw()
+        self.advanced_button.configure(text="关闭高级选项" if visible else "高级选项")
+
+    def _on_source_changed(self, *_args) -> None:
+        """Invalidate candidates and source-specific credentials when the source changes."""
+
+        url = self.url_var.get().strip()
+        if url == self._input_url:
+            return
+        if self._input_url:
+            self.access_code_var.set("")
+            self.referer_var.set("")
+        self._input_url = url
+        self.advanced_error_var.set("")
+        self.pending_history_retry = None
+        self.history_retry_record_id = ""
+        self.analyzed_url = ""
+        if self.is_analyzing or self.is_downloading:
+            return
+        self._clear_candidates()
+        self.status_var.set("待解析新链接" if url else "准备就绪")
+        self.selection_var.set("尚未解析")
+        self.progress_detail_var.set("尚未开始任务")
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self._draw_segments(0)
+        self._hide_notice()
+
+    def _sync_input_controls(self) -> None:
+        busy = self.is_analyzing or self.is_downloading
+        self.candidate_tree.configure(selectmode="none" if busy else "extended")
+        for control in self._input_controls:
+            control.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        for control in (self.best_button, self.select_all_button, self.deselect_button):
+            control.configure(state=tk.NORMAL if self.candidates and not busy else tk.DISABLED)
+        self.analyze_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.file_name_entry.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        if busy:
+            self.start_button.configure(state=tk.DISABLED)
+            for control in (self.quality_combo, self.subtitle_combo, self.subtitle_format_combo, self.auto_subtitle_check, self.embed_subtitle_check):
+                control.configure(state=tk.DISABLED)
+        if not busy:
+            self._sync_selection()
 
     def _paste_url(self) -> None:
+        if self.is_analyzing or self.is_downloading:
+            return
         try:
             value = self.clipboard_get().strip()
         except tk.TclError:
@@ -635,9 +721,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _start_analyze(self) -> None:
         """Validate input and retain query-based share codes only for the active queue. @codex-comment"""
 
+        if self.is_analyzing or self.is_downloading:
+            return
         url = self.url_var.get().strip()
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        try:
+            parsed = urlparse(url)
+            valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid:
             self._show_notice("warning", "链接格式不正确", "请输入完整的 http 或 https 视频页面、媒体直链或播放列表地址。")
             self.url_entry.focus_set()
             return
@@ -649,6 +741,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
                 self.access_code_var.set(access_code)
 
         self._hide_notice()
+        self._analysis_url = url
+        self.advanced_error_var.set("")
+        self._set_advanced_visible(False)
         self._set_busy_analyzing(True)
         self._clear_candidates()
         self.progress.stop()
@@ -678,13 +773,26 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _start_download(self) -> None:
         """Deduplicate selected media, resolve existing-output policy, and start the serial queue. @codex-comment"""
 
+        if self.is_analyzing or self.is_downloading:
+            return
+        if not self.analyzed_url or self.analyzed_url != self.url_var.get().strip():
+            self._show_notice("warning", "请重新解析链接", "当前链接已改变，原来的媒体列表不再适用。")
+            self.url_entry.focus_set()
+            return
         selected_candidates = self._selected_candidates()
         if not selected_candidates:
             self.history_retry_record_id = ""
             self._show_notice("warning", "尚未选择媒体", "先解析链接，然后选择一个或多个媒体条目。")
             return
         candidates, repeated_selection_count = _deduplicate_candidates(selected_candidates)
+        concurrency = self._validated_concurrency()
+        if concurrency is None:
+            return
 
+        if not self.output_dir_var.get().strip():
+            self._show_notice("warning", "请选择保存目录", "保存目录不能为空。")
+            self.output_dir_entry.focus_set()
+            return
         output_dir = Path(self.output_dir_var.get()).expanduser()
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -713,7 +821,6 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._show_notice("info", "已跳过重复视频", f"已跳过 {total_skipped} 项，其余 {len(queue)} 项将继续下载。")
             self._log(f"重复检测已跳过 {total_skipped} 个条目")
 
-        concurrency = max(1, min(32, int(self.concurrency_var.get())))
         keep_cache = self.keep_cache_var.get()
         preferences = self._download_preferences()
         referer_override = self.referer_var.get().strip()
@@ -750,6 +857,21 @@ class UniversalVideoDownloaderApp(tk.Tk):
             daemon=True,
         )
         self.download_thread.start()
+
+    def _validated_concurrency(self) -> int | None:
+        try:
+            value = int(self.concurrency_var.get())
+            if 1 <= value <= 32:
+                self.advanced_error_var.set("")
+                return value
+        except (ValueError, TypeError, tk.TclError):
+            pass
+        self._show_notice("warning", "并发数不正确", "请输入 1 到 32 之间的整数。")
+        self.advanced_error_var.set("并发数：请输入 1 到 32 之间的整数。")
+        self._set_advanced_visible(True)
+        self.concurrency_entry.focus_set()
+        self.concurrency_entry.selection_range(0, tk.END)
+        return None
 
     def _download_worker(
         self,
@@ -953,7 +1075,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         return [self.candidates[index] for index in sorted(indices)]
 
     def _select_best_candidate(self) -> None:
-        if not self.candidates:
+        if not self.candidates or self.is_analyzing or self.is_downloading:
             return
         if self.candidates[0].playlist_count > 1:
             items = tuple(str(index) for index in range(len(self.candidates)))
@@ -968,20 +1090,51 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.candidate_tree.see(iid)
         self._sync_selection()
 
+    def _select_all_candidates(self, _event=None) -> str:
+        if self.candidates and not self.is_analyzing and not self.is_downloading:
+            self.candidate_tree.selection_set(self.candidate_tree.get_children())
+            self._sync_selection()
+        return "break"
+
+    def _deselect_candidates(self, _event=None) -> str:
+        if not self.is_analyzing and not self.is_downloading:
+            self.candidate_tree.selection_remove(self.candidate_tree.selection())
+            self._sync_selection()
+        return "break"
+
     def _sync_selection(self) -> None:
         """Reflect candidate type and batch shape in output controls and task details. @codex-comment"""
 
+        if self.is_analyzing or self.is_downloading:
+            return
+        selection = tuple(self.candidate_tree.selection())
+        selection_changed = selection != self._selection_ids
+        self._selection_ids = selection
         candidates = self._selected_candidates()
+        self.deselect_button.configure(state=tk.NORMAL if candidates else tk.DISABLED)
+        self.start_button.configure(state=tk.NORMAL if candidates and self.analyzed_url == self.url_var.get().strip() else tk.DISABLED)
         if not candidates:
+            self.start_button.configure(text="开始下载", state=tk.DISABLED)
+            self.file_name_var.set("未选择媒体")
+            self.file_name_entry.configure(state=tk.DISABLED)
+            self.selection_var.set(f"已选择 0 / {len(self.candidates)} 项" if self.candidates else "尚未解析")
+            self._refresh_format_details([])
+            self.partial_button.grid_remove()
+            self.task_controls.columnconfigure(2, weight=0)
             return
         candidate = candidates[0]
         file_stem = sanitize_file_name(candidate.title.split(" / ", 1)[0], "video")
-        if candidate.source_type == "baidupan":
-            self.file_name_var.set("由分享目录决定")
-        else:
-            self.file_name_var.set(file_stem + _default_suffix_for_candidate(candidate))
+        editable_name = len(candidates) == 1 and candidate.source_type != "baidupan"
+        self.file_name_entry.configure(state=tk.NORMAL if editable_name else tk.DISABLED)
+        if selection_changed:
+            if len(candidates) > 1:
+                self.file_name_var.set("按各条目标题命名")
+            elif candidate.source_type == "baidupan":
+                self.file_name_var.set("由分享目录决定")
+            else:
+                self.file_name_var.set(file_stem + _default_suffix_for_candidate(candidate))
         if len(candidates) > 1:
-            self.selection_var.set(f"已选择 {len(candidates)} 个条目 · 将按标题依次下载")
+            self.selection_var.set(f"已选择 {len(candidates)} / {len(self.candidates)} 项 · 按列表顺序依次下载")
             self.start_button.configure(text=f"下载选中项 ({len(candidates)})")
         else:
             self.selection_var.set(_candidate_summary(candidate))
@@ -999,8 +1152,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _refresh_format_details(self, candidates: list[VideoCandidate]) -> None:
         for item in self.format_tree.get_children():
             self.format_tree.delete(item)
-        candidate = candidates[0]
-        for index, media_format in enumerate(candidate.formats):
+        for index, media_format in enumerate(candidates[0].formats if candidates else ()):
             self.format_tree.insert(
                 "",
                 tk.END,
@@ -1025,6 +1177,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.subtitle_var.set("不下载字幕")
         subtitle_state = tk.NORMAL if self.subtitle_choices else tk.DISABLED
         self.auto_subtitle_check.configure(state=subtitle_state)
+        self.subtitle_combo.configure(state="readonly" if self.subtitle_choices else tk.DISABLED)
+        self.subtitle_format_combo.configure(state="readonly" if self.subtitle_choices else tk.DISABLED)
+        self.embed_subtitle_check.configure(state=tk.NORMAL if self.subtitle_choices and ffmpeg_capability().available else tk.DISABLED)
+        self.quality_combo.configure(state="readonly" if any(item.source_type in {"youtube", "ytdlp"} for item in candidates) else tk.DISABLED)
 
     def _on_subtitle_selected(self) -> None:
         _language, automatic_only = self.subtitle_choices.get(self.subtitle_var.get(), ("", False))
@@ -1057,9 +1213,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
     def _clear_candidates(self) -> None:
         self.candidates = []
+        self.analyzed_url = ""
+        self._selection_ids = ()
         self.candidate_count_var.set("等待解析")
         self.selection_var.set("正在查找可下载媒体")
         if hasattr(self, "candidate_empty_label"):
+            self.candidate_empty_label.configure(text="正在解析媒体" if self.is_analyzing else "暂无媒体")
             self.candidate_empty_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         for item in self.candidate_tree.get_children():
             self.candidate_tree.delete(item)
@@ -1071,14 +1230,19 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.subtitle_var.set("不下载字幕")
         self.start_button.configure(text="开始下载")
         self.best_button.configure(state=tk.DISABLED)
+        self.select_all_button.configure(state=tk.DISABLED)
+        self.deselect_button.configure(state=tk.DISABLED)
+        self.file_name_entry.configure(state=tk.DISABLED)
         self.start_button.configure(state=tk.DISABLED)
 
     def _set_busy_analyzing(self, busy: bool) -> None:
         """Reflect analysis state in primary and history actions. @codex-comment"""
 
         self.is_analyzing = busy
+        self.candidate_empty_label.configure(text="正在解析媒体" if busy else "暂无媒体")
         self.analyze_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         self.status_var.set("正在解析媒体" if busy else "等待开始下载")
+        self._sync_input_controls()
         self._sync_history_actions()
 
     def _poll_browser_inbox(self) -> None:
@@ -1191,6 +1355,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.partial_button.configure(state=tk.NORMAL if active and self.current_candidate and self.current_candidate.source_type == "hls" else tk.DISABLED)
         if not active:
             self.pause_button.configure(text="暂停")
+        self._sync_input_controls()
         self._sync_history_actions()
 
     def _core_callback(self, event: str, payload: dict) -> None:
@@ -1210,23 +1375,31 @@ class UniversalVideoDownloaderApp(tk.Tk):
         if event == "analysis_done":
             self._on_analysis_done(payload["candidates"])
         elif event == "analysis_error":
+            if self._discard_stale_analysis():
+                return
+            error = classify_error(payload.get("error", "解析失败"))
             retry_record = self.pending_history_retry
             self.pending_history_retry = None
             self.access_code_var.set("")
             self.progress.stop()
             self.progress.configure(mode="determinate", value=0)
             self._set_busy_analyzing(False)
+            self.candidate_count_var.set("解析未完成")
+            self.progress_detail_var.set("解析未完成")
             if retry_record is not None:
-                error = classify_error(payload.get("error", "解析失败"))
                 self.status_var.set("历史任务无法继续")
                 self._log(f"历史任务重新解析失败：{error.detail or error.message}", "warning")
                 if error.code in {"pikpak_code_required", "pikpak_code_invalid", "baidupan_code_required", "baidupan_code_invalid"}:
                     self.pending_history_retry = retry_record
-                    self._show_notice("warning", "需要重新输入提取码", "在高级选项中输入提取码后点击“解析媒体”，匹配成功后会自动继续下载。")
+                    self._show_notice("warning", "需要重新输入提取码", "输入提取码后按回车，匹配成功后会自动继续下载。")
                 else:
                     self._show_notice("warning", "需要更新原链接", "脱敏来源已失效，请粘贴原视频页面链接后重新解析。")
             else:
-                self._show_error(classify_error(payload.get("error", "解析失败")))
+                self._show_error(error)
+            if error.code in {"pikpak_code_required", "pikpak_code_invalid", "baidupan_code_required", "baidupan_code_invalid"}:
+                self.advanced_error_var.set(error.message)
+                self._set_advanced_visible(True)
+                self.after_idle(self.access_code_entry.focus_set)
         elif event == "browser_companion_installed":
             self.companion_button.configure(state=tk.NORMAL)
             extension = Path(str(payload.get("extension", "")))
@@ -1356,15 +1529,32 @@ class UniversalVideoDownloaderApp(tk.Tk):
         elif event == "log":
             self._log(str(payload.get("message", "")), str(payload.get("level", "info")))
 
+    def _discard_stale_analysis(self) -> bool:
+        if self._analysis_url == self.url_var.get().strip():
+            return False
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self._clear_candidates()
+        self._set_busy_analyzing(False)
+        self.pending_history_retry = None
+        self.status_var.set("待解析新链接")
+        self._show_notice("info", "链接已改变", "已忽略上一个链接的解析结果，请解析当前链接。")
+        return True
+
     def _on_analysis_done(self, candidates: list[VideoCandidate]) -> None:
         """Render discovered media or auto-continue one pending history retry. @codex-comment"""
 
+        if self._discard_stale_analysis():
+            return
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self.progress_detail_var.set("解析完成，等待开始下载")
         self._set_busy_analyzing(False)
+        self._clear_candidates()
+        self.analyzed_url = self._analysis_url
+        self.advanced_error_var.set("")
         self.candidates = candidates
-        self.candidate_count_var.set(f"找到 {len(candidates)} 个版本")
+        self.candidate_count_var.set(f"共 {len(candidates)} 项")
         if not candidates:
             retry_record = self.pending_history_retry
             self.pending_history_retry = None
@@ -1392,8 +1582,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
                 ),
             )
         is_playlist = bool(candidates and candidates[0].playlist_count > 1)
-        self.best_button.configure(state=tk.NORMAL, text="全选列表" if is_playlist else "选择推荐项")
-        self.start_button.configure(state=tk.NORMAL)
+        if is_playlist:
+            self.best_button.grid_remove()
+        else:
+            self.best_button.grid()
+        self._sync_input_controls()
         if self.pending_history_retry is not None:
             self._continue_history_after_analysis()
             return
@@ -1402,7 +1595,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.candidate_tree.focus("0")
             self._sync_selection()
             self._log(f"发现播放列表中的 {len(candidates)} 个媒体条目，默认选择第一项。")
-            self._show_notice("success", "播放列表解析完成", f"找到 {len(candidates)} 个条目，可多选或点击“全选列表”加入下载队列。")
+            self._show_notice("success", "播放列表解析完成", f"找到 {len(candidates)} 个条目。")
         else:
             self._select_best_candidate()
             self._log(f"发现 {len(candidates)} 个可下载媒体，已选择推荐项。")
