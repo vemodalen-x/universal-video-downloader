@@ -14,6 +14,12 @@
 
 ### Improved
 
+- Isolate HLS partial-export completion/errors from the queue lifecycle, capture the requested job, and block duplicate export requests.
+- Reject empty HLS exports and zero-byte segments during final assembly; serialize partial/final output with cache cleanup and clean unique temporary output files after failed exports.
+- Reset progress and controls between queue items, and show an accurate stopped-queue summary.
+- Open provider-specific history directories without creating missing folders, fall back to an existing parent, and show selected task errors in the history view.
+- Keep logs read-only and bounded to 2000 lines, preserve manual reading position, and redact entire authorization/cookie headers instead of only their first token.
+
 - Invalidate old media and source-specific credentials when the input link changes; ignore late results and block overlapping analysis/download starts.
 - Add explicit select-all and deselect actions with keyboard support, accurate selection counts, disabled empty-selection downloads, and clear per-title batch naming.
 - Preserve custom filenames across duplicate Tk selection events, including automatic history continuation into the original output path.

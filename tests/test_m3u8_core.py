@@ -7,6 +7,7 @@ import socket
 import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 import requests
@@ -41,6 +42,119 @@ from m3u8_core import (
 
 PIKPAK_TEST_SHARE_URL = "https://mypikpak.com/s/test-share-id-12345/test-item-id-67890"
 BAIDUPAN_TEST_SHARE_URL = "https://pan.baidu.com/s/1SyntheticShareToken"
+
+
+def _cached_hls_job(tmp_path, keep_cache=True):
+    playlist = parse_playlist(
+        "https://example.com/playlist.m3u8",
+        "#EXTM3U\n#EXTINF:1,\none.ts\n#EXTINF:1,\ntwo.ts\n#EXT-X-ENDLIST\n",
+    ).media
+    job = DownloadJob(playlist, tmp_path / "video.ts", keep_cache=keep_cache)
+    job._prepare()
+    return job
+
+
+@pytest.mark.parametrize("require_all", [True, False])
+@pytest.mark.parametrize("zero_byte_files", [True, False])
+def test_hls_combine_rejects_empty_cache_without_replacing_output(tmp_path, require_all, zero_byte_files):
+    job = _cached_hls_job(tmp_path)
+    if zero_byte_files:
+        for segment in job.playlist.segments:
+            job._segment_path(segment).touch()
+    target = tmp_path / ("video.ts" if require_all else "video.partial.ts")
+    target.write_bytes(b"previous output")
+    with pytest.raises(HlsError):
+        job.combine(require_all=require_all)
+    assert target.read_bytes() == b"previous output"
+    assert not target.with_suffix(".ts.part").exists()
+
+
+def test_partial_hls_export_uses_available_nonempty_segments(tmp_path):
+    job = _cached_hls_job(tmp_path)
+    job._segment_path(job.playlist.segments[0]).write_bytes(b"first")
+    job._segment_path(job.playlist.segments[1]).touch()
+    assert job.combine(require_all=False).read_bytes() == b"first"
+    with pytest.raises(HlsError):
+        job.combine(require_all=True)
+
+
+def test_hls_export_validates_actual_output_and_cleans_failed_temporary_file(monkeypatch, tmp_path):
+    job = _cached_hls_job(tmp_path)
+    for segment in job.playlist.segments:
+        job._segment_path(segment).write_bytes(b"cached data")
+    target = tmp_path / "video.partial.ts"
+    target.write_bytes(b"previous preview")
+    monkeypatch.setattr(m3u8_core.shutil, "copyfileobj", lambda *args, **kwargs: None)
+    with pytest.raises(HlsError, match="为空"):
+        job.combine(require_all=False)
+    assert target.read_bytes() == b"previous preview"
+    assert not list(tmp_path.glob(".*.part"))
+
+
+def test_partial_export_serializes_with_final_combine_and_cache_cleanup(monkeypatch, tmp_path):
+    job = _cached_hls_job(tmp_path, keep_cache=False)
+    for segment in job.playlist.segments:
+        job._segment_path(segment).write_bytes(bytes([segment.index + 1]))
+    entered = threading.Event()
+    release = threading.Event()
+    prepared = threading.Event()
+    combine = job._combine_locked
+    prepare = job._prepare
+    events = []
+    errors = []
+    job.callback = lambda event, payload: events.append(event)
+
+    def blocking_combine(require_all, partial_suffix):
+        if not require_all:
+            entered.set()
+            assert release.wait(3)
+        return combine(require_all, partial_suffix)
+
+    def record_prepare():
+        prepare()
+        prepared.set()
+
+    def export():
+        try:
+            job.combine(require_all=False)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(job, "_combine_locked", blocking_combine)
+    monkeypatch.setattr(job, "_prepare", record_prepare)
+    partial = threading.Thread(target=export)
+    final = threading.Thread(target=job.run)
+    partial.start()
+    try:
+        assert entered.wait(2)
+        final.start()
+        assert prepared.wait(2)
+        assert job.cache_dir.is_dir()
+        assert "completed" not in events
+    finally:
+        release.set()
+        partial.join(3)
+        if final.ident is not None:
+            final.join(3)
+    assert not partial.is_alive() and not final.is_alive()
+    assert not errors and "fatal" not in events
+    assert "completed" in events
+    assert (tmp_path / "video.partial.ts").read_bytes() == b"\x01\x02"
+    assert job.output_path.read_bytes() == b"\x01\x02"
+    assert not job.cache_dir.exists()
+
+
+@pytest.mark.parametrize("header", [
+    "Authorization: Bearer demo-secret",
+    "Proxy-Authorization: Basic demo-secret",
+    "Cookie: first=demo-secret; second=demo-cookie",
+    "Set-Cookie: first=demo-secret; second=demo-cookie",
+])
+def test_redaction_removes_complete_sensitive_headers(header):
+    redacted = redact_sensitive_text(header + "\nHTTP 503, retry later")
+    assert "demo-secret" not in redacted
+    assert "demo-cookie" not in redacted
+    assert "HTTP 503, retry later" in redacted
 
 
 class FakePikPakResponse:
@@ -280,6 +394,57 @@ media.bin
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_hls_combine_rejects_empty_segments_and_duplicate_partial_exports(tmp_path, monkeypatch) -> None:
+    playlist = parse_playlist(
+        "https://example.com/video/index.m3u8",
+        "#EXTM3U\n#EXTINF:4,\nfirst.ts\n#EXTINF:4,\nsecond.ts\n",
+    ).media
+    assert playlist is not None
+    output = tmp_path / "video.mp4"
+    job = DownloadJob(playlist, output, concurrency=1)
+    paths = [job._segment_path(segment) for segment in playlist.segments]
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_bytes(b"first")
+    paths[1].write_bytes(b"")
+
+    with pytest.raises(HlsError):
+        job.combine(require_all=True)
+    assert not output.exists()
+
+    paths[1].write_bytes(b"second")
+    entered = threading.Event()
+    release = threading.Event()
+    original_copyfileobj = m3u8_core.shutil.copyfileobj
+
+    def delayed_copyfileobj(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_copyfileobj(*args, **kwargs)
+
+    monkeypatch.setattr(m3u8_core.shutil, "copyfileobj", delayed_copyfileobj)
+    result: list[Path] = []
+    errors: list[Exception] = []
+
+    def export_partial() -> None:
+        try:
+            result.append(job.combine(require_all=False))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=export_partial)
+    worker.start()
+    assert entered.wait(5)
+    with pytest.raises(HlsError, match="已有导出任务"):
+        job.combine(require_all=False)
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert result[0].read_bytes() == b"firstsecond"
+    assert not list(tmp_path.glob(".*.part"))
 
 
 def test_hls_retry_adopts_legacy_cache_for_same_output(tmp_path) -> None:

@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import m3u8_desktop_app as desktop  # noqa: E402
-from m3u8_core import HlsError, VideoCandidate  # noqa: E402
+from m3u8_core import DownloadRecord, HlsError, VideoCandidate  # noqa: E402
 
 
 def assert_visible(widget) -> None:
@@ -110,8 +110,35 @@ def run(capture_dir: Path | None = None) -> None:
                 assert_visible(app.concurrency_entry)
                 assert_visible(app.advanced_done_button)
                 capture(app.advanced_window, capture_dir, "code-recovery.png")
+                app._set_advanced_visible(False)
+                app.history_records = [DownloadRecord(
+                    record_id="demo-history", title="Demo episode", source_type="direct",
+                    source_url="https://example.com/episode", source_host="example.com",
+                    output_path="Demo downloads/episode.mp4", status="failed",
+                    error_code="network_timeout", error_message="Connection timed out",
+                )]
+                app.main_notebook.select(app.history_tab)
+                app._refresh_history()
+                app.history_tree.selection_set("demo-history")
+                app.update()
+                for control in (app.history_open_button, app.history_retry_button, app.history_detail_label):
+                    assert_visible(control)
+                assert "Connection timed out" in app.history_detail_var.get()
+                capture(app, capture_dir, "history-recovery.png")
+
+                app.main_notebook.select(app.download_tab)
+                log_tab = app.log_text.frame.master
+                log_tab.master.select(log_tab)
+                for index in range(desktop.MAX_LOG_LINES + 20):
+                    app._log(f"Synthetic event {index}")
+                app.update()
+                app.log_text.yview_moveto(0.2)
+                app._log("Synthetic event while reading earlier entries")
+                app.update()
+                assert app.log_text.yview()[0] < 0.8
+                assert int(app.log_text.index("end-1c").split(".")[0]) - 1 <= desktop.MAX_LOG_LINES
                 assert not errors, errors
-                print("PASS selection, active queue, changed source, and code recovery")
+                print("PASS selection, queue controls, source/code recovery, history layout, and bounded log scrolling")
             finally:
                 app.destroy()
 

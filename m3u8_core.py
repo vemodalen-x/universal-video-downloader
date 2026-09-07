@@ -1710,6 +1710,11 @@ def redact_url(value: str) -> str:
 def redact_sensitive_text(value: str) -> str:
     text = str(value or "")
     text = re.sub(
+        r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=][^\r\n]*",
+        r"\1=[已隐藏]",
+        text,
+    )
+    text = re.sub(
         r"https?://[^\s'\"<>]+",
         lambda match: redact_url(match.group(0).rstrip("),.;")) + match.group(0)[len(match.group(0).rstrip("),.;")) :],
         text,
@@ -1920,6 +1925,7 @@ class DownloadJob:
         self.pause_event.set()
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
+        self.combine_lock = threading.Lock()
         self.status: dict[int, str] = {}
         self.errors: dict[int, str] = {}
         self.key_cache: dict[str, bytes] = {}
@@ -1984,36 +1990,64 @@ class DownloadJob:
                 return
 
             self.combine(require_all=True)
-            if not self.keep_cache:
-                shutil.rmtree(self.cache_dir, ignore_errors=True)
             _emit(self.callback, "completed", output=str(self.output_path))
         except Exception as exc:
             _emit(self.callback, "fatal", message=str(exc))
 
     def combine(self, require_all: bool = True, partial_suffix: str = ".partial") -> Path:
+        """Serialize exports, reject duplicate partial exports, and clean cache under the same lock."""
+
+        if require_all:
+            with self.combine_lock:
+                target = self._combine_locked(require_all, partial_suffix)
+                if not self.keep_cache:
+                    shutil.rmtree(self.cache_dir, ignore_errors=True)
+                return target
+        if not self.combine_lock.acquire(blocking=False):
+            raise HlsError("已有导出任务正在进行，请等待当前导出完成")
+        try:
+            return self._combine_locked(require_all, partial_suffix)
+        finally:
+            self.combine_lock.release()
+
+    def _combine_locked(self, require_all: bool, partial_suffix: str) -> Path:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         target = self.output_path
         segments = self.playlist.segments
+        available = []
+        for segment in segments:
+            path = self._segment_path(segment)
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    available.append(path)
+            except OSError:
+                continue
         if require_all:
-            missing = [segment.index for segment in segments if not self._segment_path(segment).exists()]
+            missing = len(segments) - len(available)
             if missing:
-                raise HlsError(f"还有 {len(missing)} 个分片未下载，不能合并完整文件")
+                raise HlsError(f"还有 {missing} 个分片为空或未下载，不能合并完整文件")
         else:
             stem = self.output_path.stem + partial_suffix
             target = self.output_path.with_name(stem + self.output_path.suffix)
 
-        temp_output = target.with_suffix(target.suffix + ".part")
+        if not available:
+            raise HlsError("尚无完整下载的分片，暂时无法合并。")
+
+        temp_output = target.with_name(
+            f".{target.name}.{os.getpid()}.{threading.get_ident()}.part"
+        )
         _emit(self.callback, "combining", output=str(target), partial=not require_all)
-        with temp_output.open("wb") as output:
-            for segment in segments:
-                path = self._segment_path(segment)
-                if not path.exists():
-                    if require_all:
-                        raise HlsError(f"缺少分片：{segment.index}")
-                    continue
-                with path.open("rb") as item:
-                    shutil.copyfileobj(item, output, length=1024 * 1024)
-        temp_output.replace(target)
+        try:
+            with temp_output.open("wb") as output:
+                for path in available:
+                    with path.open("rb") as item:
+                        shutil.copyfileobj(item, output, length=1024 * 1024)
+                bytes_written = output.tell()
+            if bytes_written <= 0:
+                raise HlsError("导出的媒体文件为空，已拒绝发布")
+            temp_output.replace(target)
+        finally:
+            temp_output.unlink(missing_ok=True)
         _emit(self.callback, "combined", output=str(target), partial=not require_all)
         return target
 

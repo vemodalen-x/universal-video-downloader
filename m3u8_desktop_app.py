@@ -39,6 +39,7 @@ from m3u8_core import (
     make_headers,
     media_identity_url,
     redact_url,
+    redact_sensitive_text,
     refresh_pikpak_candidate,
     sanitize_file_name,
 )
@@ -49,6 +50,7 @@ APP_TITLE = "通用视频下载器"
 UI_REFRESH_INTERVAL_MS = 100
 BROWSER_INBOX_INTERVAL_MS = 1000
 MAX_SEGMENT_BLOCKS = 160
+MAX_LOG_LINES = 2000
 BATCH_ITEM_MAX_ATTEMPTS = 3
 BATCH_ITEM_RETRY_BACKOFF_SECONDS = 1.5
 HISTORY_RETRY_STATES = frozenset({"failed", "stopped", "interrupted"})
@@ -73,6 +75,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.pending_history_retry: DownloadRecord | None = None
         self.history_retry_record_id = ""
         self.download_thread: threading.Thread | None = None
+        self.partial_export_job: DownloadJob | None = None
         self.queue_stop_event = threading.Event()
         self.queue_total = 0
         self.queue_completed = 0
@@ -124,6 +127,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_query_var = tk.StringVar()
         self.history_filter_var = tk.StringVar(value="全部状态")
         self.history_summary_var = tk.StringVar(value="0 个任务")
+        self.history_detail_var = tk.StringVar(value="请选择任务查看状态")
 
         self._configure_style()
         self._build_ui()
@@ -498,7 +502,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         log_tab.rowconfigure(0, weight=1)
         self.log_text = ScrolledText(log_tab, height=6, wrap=tk.WORD, borderwidth=0, font=("Cascadia Mono", 9))
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
-        self.log_text.configure(bg="#F7F8FA", fg="#30343B", insertbackground="#30343B", relief=tk.FLAT, padx=10, pady=9)
+        self.log_text.configure(bg="#F7F8FA", fg="#30343B", insertbackground="#30343B", relief=tk.FLAT, padx=10, pady=9, state=tk.DISABLED)
 
         format_tab.columnconfigure(0, weight=1)
         format_tab.rowconfigure(0, weight=1)
@@ -557,7 +561,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_filter.grid(row=0, column=2, padx=(0, 8))
         self.history_summary_label = ttk.Label(toolbar, textvariable=self.history_summary_var, style="Count.TLabel")
         self.history_summary_label.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=(12, 0), pady=(3, 0))
-        ttk.Button(toolbar, text="打开文件夹", command=self._open_history_output).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+        self.history_open_button = ttk.Button(toolbar, text="打开文件夹", command=self._open_history_output, state=tk.DISABLED)
+        self.history_open_button.grid(row=0, column=3, rowspan=2, padx=(8, 0))
         self.history_retry_button = ttk.Button(
             toolbar,
             text="继续下载",
@@ -593,6 +598,9 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_tree.bind("<Double-1>", lambda _event: self._open_history_output())
         self.history_tree.bind("<Return>", lambda _event: self._retry_history())
         self.history_tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_history_actions())
+        self.history_detail_label = ttk.Label(list_frame, textvariable=self.history_detail_var, style="Muted.TLabel", width=1, wraplength=900)
+        self.history_detail_label.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        list_frame.bind("<Configure>", lambda event: self.history_detail_label.configure(wraplength=max(200, event.width - 32)))
         for status, color in {
             "downloading": "#1677FF",
             "completed": "#18794E",
@@ -1041,20 +1049,34 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
     def _stop_download(self) -> None:
         self.queue_stop_event.set()
+        self.pause_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.DISABLED)
+        self.partial_button.configure(state=tk.DISABLED)
+        self.status_var.set("正在安全停止")
         if self.current_job:
             self.current_job.stop()
 
     def _combine_partial(self) -> None:
-        if not isinstance(self.current_job, DownloadJob):
+        job = self.current_job
+        if not self.is_downloading or self.queue_stop_event.is_set() or not isinstance(job, DownloadJob) or self.partial_export_job is not None:
             return
+        self.partial_export_job = job
+        self._sync_partial_button()
+        threading.Thread(target=self._partial_export_worker, args=(job,), daemon=True).start()
 
-        def worker() -> None:
-            try:
-                self.current_job.combine(require_all=False)
-            except Exception as exc:
-                self.event_buffer.put("fatal", {"error": exc})
+    def _partial_export_worker(self, job: DownloadJob) -> None:
+        try:
+            output = job.combine(require_all=False)
+            self.event_buffer.put("partial_export_completed", {"job": job, "output": str(output)})
+        except Exception as exc:
+            self.event_buffer.put("partial_export_failed", {"job": job, "error": exc})
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _sync_partial_button(self) -> None:
+        supported = self.is_downloading and isinstance(self.current_job, DownloadJob) and not self.queue_stop_event.is_set()
+        self.partial_button.configure(
+            state=tk.NORMAL if supported and self.partial_export_job is None else tk.DISABLED,
+            text="正在导出" if self.partial_export_job is not None else "合并部分",
+        )
 
     def _selected_candidate(self) -> VideoCandidate | None:
         candidates = self._selected_candidates()
@@ -1352,7 +1374,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         )
         self.pause_button.configure(state=tk.NORMAL if pause_supported else tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL if active else tk.DISABLED)
-        self.partial_button.configure(state=tk.NORMAL if active and self.current_candidate and self.current_candidate.source_type == "hls" else tk.DISABLED)
+        self._sync_partial_button()
         if not active:
             self.pause_button.configure(text="暂停")
         self._sync_input_controls()
@@ -1425,6 +1447,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.current_record_id = self.history_retry_record_id or uuid.uuid4().hex
             self.history_retry_record_id = ""
             self._reset_progress_estimator()
+            self.progress["value"] = 0
+            self._draw_segments(0)
+            self.pause_button.configure(text="暂停", state=tk.DISABLED)
+            self.partial_button.configure(state=tk.DISABLED)
             self._create_history_record(candidate, output_path)
             index = int(payload.get("index", 1))
             total = int(payload.get("total", 1))
@@ -1464,6 +1490,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
             total = int(payload.get("total", 0))
             if payload.get("stopped"):
                 self.status_var.set("下载队列已停止")
+                self.progress_detail_var.set(f"已停止：完成 {completed} 项，失败 {failed} 项，未完成 {max(0, total - completed - failed)} 项")
                 self._show_notice("info", "队列已停止", f"已完成 {completed}/{total} 项，已下载数据和续传缓存均已保留。")
             elif failed:
                 self.status_var.set("下载队列已完成，部分项目需重试")
@@ -1498,10 +1525,23 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._history_update(status="stopped", force=True)
             self.current_job = None
             self._show_notice("info", "任务已停止", "已下载数据仍保留在本机，再次开始相同任务时会尝试续传。")
-        elif event == "combining":
+        elif event in {"partial_export_completed", "partial_export_failed"}:
+            if payload.get("job") is not self.partial_export_job:
+                return
+            self.partial_export_job = None
+            self._sync_partial_button()
+            if event == "partial_export_completed":
+                name = Path(payload["output"]).name
+                self._log("部分媒体已导出：" + name)
+                self._show_notice("info", "部分媒体已导出", name)
+            else:
+                error = classify_error(payload.get("error", "部分媒体导出失败"))
+                self._log(f"部分媒体导出失败：{error.detail or error.message}", "warning")
+                self._show_notice("warning", "部分媒体暂未导出", "下载队列未受影响，可等待更多分片完成后重试；详情见活动日志。")
+        elif event == "combining" and not payload.get("partial"):
             self.status_var.set("正在封装媒体文件")
             self._log("开始生成输出文件")
-        elif event == "combined":
+        elif event == "combined" and not payload.get("partial"):
             self._log("输出文件已生成：" + Path(payload.get("output", "")).name)
         elif event == "completed":
             self._set_downloading_state(False)
@@ -1837,18 +1877,30 @@ class UniversalVideoDownloaderApp(tk.Tk):
             and not self.is_downloading
         )
         self.history_retry_button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        if hasattr(self, "history_open_button"):
+            self.history_open_button.configure(state=tk.NORMAL if record and record.output_path else tk.DISABLED)
+        if hasattr(self, "history_detail_var"):
+            self.history_detail_var.set(
+                f"{_history_status_label(record.status)} · {record.error_message or record.title}"
+                if record else "请选择任务查看状态"
+            )
 
     def _open_history_output(self) -> None:
         record = self._selected_history()
-        if not record:
-            self._show_notice("info", "请选择任务", "选择一条任务记录后，可以打开保存目录或查看任务详情。")
+        if not record or not record.output_path:
+            self.history_detail_var.set("请选择有保存位置的任务")
             return
-        path = Path(record.output_path).expanduser().parent
+        path, _name = _history_output_settings(record)
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            path = path.expanduser().resolve()
+            while not path.is_dir() and path != path.parent:
+                path = path.parent
+            if not path.is_dir():
+                self.history_detail_var.set("保存目录不存在或磁盘未连接，请确认文件位置后重试。")
+                return
             os.startfile(path)
         except OSError as exc:
-            self._show_error(classify_error(exc))
+            self.history_detail_var.set(classify_error(exc).message)
 
     def _retry_history(self) -> None:
         """Re-analyze one retryable history source and continue into its original output path. @codex-comment"""
@@ -1937,9 +1989,19 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _log(self, message: str, level: str = "info") -> None:
         if not message:
             return
+        message = redact_sensitive_text(message)
+        follow_tail = self.log_text.yview()[1] >= 0.999
         prefix = {"error": "[错误]", "warning": "[警告]", "debug": "[调试]", "info": "[信息]"}.get(level, "[信息]")
-        self.log_text.insert(tk.END, f"{time.strftime('%H:%M:%S')} {prefix} {message}\n")
-        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.NORMAL)
+        try:
+            self.log_text.insert(tk.END, f"{time.strftime('%H:%M:%S')} {prefix} {message}\n")
+            excess = int(self.log_text.index("end-1c").split(".")[0]) - 1 - MAX_LOG_LINES
+            if excess > 0:
+                self.log_text.delete("1.0", f"{excess + 1}.0")
+            if follow_tail:
+                self.log_text.see(tk.END)
+        finally:
+            self.log_text.configure(state=tk.DISABLED)
 
     def _on_close(self) -> None:
         if self.is_downloading and not messagebox.askyesno("退出下载器", "当前任务仍在下载。退出后可依靠缓存继续，确定退出吗？"):

@@ -12,6 +12,7 @@ import pytest
 import m3u8_desktop_app
 from m3u8_core import CoalescingEventBuffer, DownloadPreferences, DownloadRecord, HlsError, SubtitleTrack, VideoCandidate
 from m3u8_desktop_app import (
+    MAX_LOG_LINES,
     MAX_SEGMENT_BLOCKS,
     UI_REFRESH_INTERVAL_MS,
     UniversalVideoDownloaderApp,
@@ -68,6 +69,11 @@ def desktop_ui(_desktop_window, tmp_path):
     app.current_candidate = None
     app.current_job = None
     app.current_record_id = ""
+    app.partial_export_job = None
+    app.queue_stop_event.clear()
+    app.history_records = []
+    app.history_store = m3u8_desktop_app.DownloadHistoryStore(tmp_path / "history.json")
+    app._refresh_history()
     app.pending_history_retry = None
     app.history_retry_record_id = ""
     app._analysis_url = ""
@@ -170,6 +176,24 @@ def test_batch_selection_and_empty_selection_controls(desktop_ui):
     assert app.deselect_button.instate(["disabled"])
     assert "0 / 125" in app.selection_var.get()
     assert not app.format_tree.get_children()
+
+
+def test_queue_item_start_resets_previous_progress(desktop_ui, tmp_path):
+    app = desktop_ui
+    app.progress["value"] = 100
+    app._draw_segments(12)
+    app._handle_event(
+        "queue_item_started",
+        {
+            "candidate": VideoCandidate("Next", "https://example.com/next.mp4", "https://example.com", source_type="direct"),
+            "output": str(tmp_path / "next.mp4"),
+            "index": 2,
+            "total": 3,
+        },
+    )
+    assert app.progress["value"] == 0
+    assert app.segment_total == 0
+    assert "队列 2/3" in app.progress_detail_var.get()
 
 
 def test_repeated_selection_event_preserves_custom_filename(desktop_ui):
@@ -286,6 +310,160 @@ def test_ui_refresh_budget_and_segment_cap() -> None:
     assert UI_REFRESH_INTERVAL_MS >= 100
     assert UI_REFRESH_INTERVAL_MS <= 100
     assert MAX_SEGMENT_BLOCKS <= 200
+
+
+def _demo_hls_job(tmp_path):
+    from m3u8_core import DownloadJob, parse_playlist
+
+    media = parse_playlist("https://example.com/video.m3u8", "#EXTM3U\n#EXTINF:1,\none.ts\n").media
+    return DownloadJob(media, tmp_path / "video.ts")
+
+
+def test_partial_export_failure_does_not_unlock_queue(desktop_ui, tmp_path):
+    app = desktop_ui
+    _render_demo_candidates(app, source_type="hls")
+    job = _demo_hls_job(tmp_path)
+    app.current_job = job
+    app.current_candidate = app.candidates[0]
+    app._set_downloading_state(True)
+    app.partial_export_job = job
+    status = app.status_var.get()
+    app._partial_export_worker(job)
+    events = app.event_buffer.drain()
+    assert [event for event, _ in events] == ["partial_export_failed"]
+    for event, payload in events:
+        app._handle_event(event, payload)
+    assert app.is_downloading
+    assert app.current_job is job
+    assert app.status_var.get() == status
+    assert app.analyze_button.instate(["disabled"])
+    assert app.partial_export_job is None
+
+
+def test_partial_export_captures_job_and_rejects_double_click(desktop_ui, monkeypatch, tmp_path):
+    app = desktop_ui
+    job = _demo_hls_job(tmp_path)
+    app.current_job = job
+    app.is_downloading = True
+    workers = []
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: workers.append(kw)))
+    app._combine_partial()
+    app._combine_partial()
+    assert len(workers) == 1
+    assert workers[0]["args"] == (job,)
+    assert app.partial_button.instate(["disabled"])
+    app.current_job = object()
+    app._handle_event("partial_export_completed", {"job": job, "output": "video.partial.ts"})
+    assert app.is_downloading
+    assert app.partial_button.instate(["disabled"])
+
+
+@pytest.mark.parametrize("event", ["combining", "combined"])
+def test_partial_assembly_events_do_not_replace_queue_status(desktop_ui, event):
+    app = desktop_ui
+    app.status_var.set("Current queue state")
+    app._handle_event(event, {"partial": True, "output": "demo.partial.ts"})
+    assert app.status_var.get() == "Current queue state"
+
+
+def test_new_queue_item_resets_old_progress_and_controls(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.progress["value"] = 100
+    app._draw_segments(2)
+    app._update_segment(0, "done")
+    app.pause_button.configure(state="normal", text="继续")
+    app._handle_event("queue_item_started", {
+        "candidate": app.candidates[1], "output": "demo.mp4", "index": 2, "total": 3,
+    })
+    assert float(app.progress["value"]) == 0
+    assert app.segment_total == 0
+    assert app.pause_button.instate(["disabled"])
+    assert app.pause_button.cget("text") == "暂停"
+
+
+def test_stop_request_disables_controls_before_worker_ack(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.current_candidate = app.candidates[0]
+    app._set_downloading_state(True)
+    app._stop_download()
+    assert app.queue_stop_event.is_set()
+    assert app.stop_button.instate(["disabled"])
+    assert app.pause_button.instate(["disabled"])
+    assert app.is_downloading
+
+
+def test_stopped_queue_summary_does_not_show_stale_preparation(desktop_ui):
+    app = desktop_ui
+    app.progress_detail_var.set("正在准备")
+    app._handle_event("queue_finished", {"stopped": True, "total": 5, "completed": 2, "failed": 1})
+    assert app.progress_detail_var.get() == "已停止：完成 2 项，失败 1 项，未完成 2 项"
+
+
+@pytest.mark.parametrize("source_type", ["direct", "baidupan"])
+def test_history_opens_provider_output_directory(desktop_ui, monkeypatch, tmp_path, source_type):
+    app = desktop_ui
+    directory = tmp_path / "saved"
+    directory.mkdir()
+    record = DownloadRecord(
+        record_id="demo-record", title="Demo", source_type=source_type, source_url="https://example.com/",
+        source_host="example.com", output_path=str(directory if source_type == "baidupan" else directory / "video.mp4"),
+        status="completed",
+    )
+    monkeypatch.setattr(app, "_selected_history", lambda: record)
+    opened = []
+    monkeypatch.setattr(m3u8_desktop_app.os, "startfile", opened.append, raising=False)
+    app._open_history_output()
+    assert opened == [directory]
+
+
+@pytest.mark.parametrize("output", ["", "missing"])
+def test_history_browse_never_creates_missing_directories(desktop_ui, monkeypatch, tmp_path, output):
+    app = desktop_ui
+    directory = tmp_path / "missing"
+    record = DownloadRecord(
+        record_id="demo-record", title="Demo", source_type="direct", source_url="https://example.com/",
+        source_host="example.com", output_path=str(directory / "video.mp4") if output else "", status="failed",
+    )
+    monkeypatch.setattr(app, "_selected_history", lambda: record)
+    opened = []
+    monkeypatch.setattr(m3u8_desktop_app.os, "startfile", opened.append, raising=False)
+    app._open_history_output()
+    assert not directory.exists()
+    assert opened == ([tmp_path] if output else [])
+
+
+def test_log_is_readonly_bounded_and_redacted(desktop_ui):
+    app = desktop_ui
+    app.log_text.configure(state="normal")
+    app.log_text.delete("1.0", "end")
+    app.log_text.configure(state="disabled")
+    for i in range(m3u8_desktop_app.MAX_LOG_LINES + 30):
+        app._log(f"Entry {i}")
+    app._log("Authorization: Bearer demo-secret\nCookie: a=first-private; b=second-private")
+    app._log("large entry " + "x" * 20000)
+    text = app.log_text.get("1.0", "end-1c")
+    assert len(text.splitlines()) <= m3u8_desktop_app.MAX_LOG_LINES
+    assert "demo-secret" not in text and "second-private" not in text
+    assert "Entry 0\n" not in text
+    assert "x" * 1001 not in text
+    assert str(app.log_text.cget("state")) == "disabled"
+    before = text
+    app.log_text.insert("end", "manual edit")
+    assert app.log_text.get("1.0", "end-1c") == before
+
+
+def test_log_respects_reader_scroll_position(desktop_ui, monkeypatch):
+    app = desktop_ui
+    followed = []
+    monkeypatch.setattr(app.log_text, "yview", lambda: (0.1, 0.3))
+    monkeypatch.setattr(app.log_text, "see", lambda where: followed.append(where))
+    app._log("New event while reading older entries")
+    assert not followed
+    monkeypatch.setattr(app.log_text, "yview", lambda: (0.8, 1.0))
+    app._log("New event while following latest entries")
+    assert followed == ["end"]
 
 
 def test_browser_companion_package_paths_are_portable(tmp_path) -> None:
@@ -1201,6 +1379,76 @@ def test_history_output_settings_keep_baidupan_directory(tmp_path) -> None:
     assert _history_output_settings(record) == (tmp_path, "由分享目录决定")
 
 
+def test_open_history_output_uses_existing_parent_without_creating_missing_folder(tmp_path, monkeypatch):
+    output = tmp_path / "removed-folder" / "video.mp4"
+    record = DownloadRecord(
+        record_id="missing-output",
+        title="Video",
+        source_type="direct",
+        source_url="https://example.com/video",
+        source_host="example.com",
+        output_path=str(output),
+        status="failed",
+    )
+    opened: list[Path] = []
+    details: list[str] = []
+    app = SimpleNamespace(
+        _selected_history=lambda: record,
+        history_detail_var=SimpleNamespace(set=details.append),
+    )
+    monkeypatch.setattr(m3u8_desktop_app.os, "startfile", lambda path: opened.append(Path(path)), raising=False)
+
+    UniversalVideoDownloaderApp._open_history_output(app)
+
+    assert opened == [tmp_path]
+    assert not output.parent.exists()
+    assert details == []
+
+
+def test_log_is_bounded_redacted_and_does_not_force_reader_to_tail(desktop_ui):
+    app = desktop_ui
+    app.log_text.configure(state=tk.NORMAL)
+    app.log_text.delete("1.0", tk.END)
+    app.log_text.configure(state=tk.DISABLED)
+    for index in range(MAX_LOG_LINES):
+        app._log(f"line {index}")
+    app.update_idletasks()
+    app.log_text.yview_moveto(0.2)
+    app._log("Authorization: Bearer secret-value")
+    app.update_idletasks()
+
+    line_count = int(app.log_text.index("end-1c").split(".")[0]) - 1
+    assert line_count <= MAX_LOG_LINES
+    assert "secret-value" not in app.log_text.get("1.0", tk.END)
+    assert app.log_text.yview()[0] < 0.8
+
+
+def test_partial_export_failure_does_not_fail_active_queue():
+    job = object()
+    logs: list[tuple[str, str]] = []
+    notices: list[tuple[str, str, str]] = []
+    app = SimpleNamespace(
+        partial_export_job=job,
+        current_job=job,
+        is_downloading=True,
+        partial_button=SimpleNamespace(configure=lambda **_values: None),
+        _sync_partial_button=lambda: None,
+        _log=lambda message, level="info": logs.append((message, level)),
+        _show_notice=lambda kind, title, text: notices.append((kind, title, text)),
+    )
+
+    UniversalVideoDownloaderApp._handle_event(
+        app,
+        "partial_export_failed",
+        {"job": job, "error": HlsError("尚无完整下载的分片")},
+    )
+
+    assert app.partial_export_job is None
+    assert app.current_job is job
+    assert logs[-1][1] == "warning"
+    assert notices[-1][0] == "warning"
+
+
 def test_media_identity_preserves_query_selectors_but_ignores_signatures():
     one = VideoCandidate("One", "https://cdn.example.com/video.mp4?id=1&token=first", "https://example.com/watch", source_type="direct")
     refreshed = replace(one, url="https://cdn.example.com/video.mp4?token=second&id=1")
@@ -1237,6 +1485,8 @@ def test_pause_control_enabled_for_native_active_job():
         start_button=button("start"), analyze_button=button("analyze"), pause_button=button("pause"),
         stop_button=button("stop"), partial_button=button("partial"), _sync_history_actions=lambda: None,
         _sync_input_controls=lambda: None,
+        partial_export_job=None,
+        _sync_partial_button=lambda: None,
     )
     UniversalVideoDownloaderApp._set_downloading_state(app, True)
     assert states["pause"]["state"] == "normal"
