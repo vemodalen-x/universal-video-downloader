@@ -31,14 +31,15 @@ Publish the reviewed downloader feature series as one CI-verifiable R1 integrati
 - [x] Correctness: 291 integrated core/desktop/provider/recovery tests pass without regressions.
 - [x] UX: native synthetic UI smoke passes at 1220x840 and 1040x720, covering search/order, progress/motion, queue controls, recovery and log scrolling.
 - [x] Privacy/package: ruff, source privacy scan (`tracked=112`) and package metadata tests pass; no binary, screenshot or user data enters the commit.
-- [ ] Delivery: one active R1 integration task has a current machine receipt and GitHub CI passes before merge.
+- [x] Delivery: one active R1 integration task has a current machine receipt; GitHub CI run `34487018516` passed and PR #11 merged as `02d426a5e9342008d121d3563014cba205fe19f8`.
 
 ## Execution Log
 - 2026-09-10 PR #11 exposed a deterministic CI failure: its 10 historical task files each required a distinct receipt, while CI produced one receipt. This integration keeps the historical content but archives the completed records so the full source delta is certified by one fresh integration receipt.
 - 2026-09-10 Local verification: `python -m pytest tests -q` passed (291 passed); targeted `ruff check` passed; source privacy scan passed (`tracked=112`); `tools/desktop_ux_smoke.py` passed at both supported window sizes; machine acceptance passed with build exit 0 and smoke exit 0 using the evidence log above.
+- 2026-09-10 Remote verification: PR #11 `vemo` check passed in GitHub Actions run `34487018516`; PR #11 merged into `main` as `02d426a5e9342008d121d3563014cba205fe19f8`.
 
 ## Read Audit
 - Reviewed PR #11, the failed GitHub Actions log, the VEMO pre-push task selection logic, and the complete source-only diff to `main`.
 
 ## Conclusion
-Outcome: accepted locally. Decision: archive completed task records and validate the full PR range as a single R1 integration. Risk: no live provider or binary-release claim; existing behavior remains covered by source and native synthetic tests. Next action: run push gate, update PR #11 and merge only after remote CI passes.
+Outcome: accepted | Decision: merge | Key Evidence: machine receipt `.vemo/run/T-20260910-mainline-pr-integration-20260910-220404.log`, 291 tests, native UX smoke, privacy/package scan, GitHub Actions run `34487018516`, and merged PR #11 (`02d426a5e9342008d121d3563014cba205fe19f8`) | Risk: no live provider or binary-release claim; existing behavior remains covered by source and native synthetic tests | Next Action: archive this completed task record during routine governance maintenance.
