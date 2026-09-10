@@ -20,6 +20,8 @@ REQUIRED_ENTRIES = frozenset(
     {
         "UniversalVideoDownloader.exe",
         "UniversalVideoDownloaderBridge.exe",
+        "BaiduPCS-Go.exe",
+        "BaiduPCS-Go-LICENSE.txt",
         "browser-extension/manifest.json",
         "install_browser_companion.ps1",
         "README.md",
@@ -29,6 +31,9 @@ REQUIRED_ENTRIES = frozenset(
         "THIRD_PARTY_NOTICES.md",
     }
 )
+PINNED_VENDOR_BINARY_SHA256 = {
+    "BaiduPCS-Go.exe": "e44769b49156fa3f094431da87231021e6874b6519ea82da4b8af0637662576d",
+}
 TEXT_ENTRY_SUFFIXES = frozenset(
     {
         ".bak",
@@ -263,6 +268,12 @@ def _scan_entries(archive: ZipFile) -> list[str]:
             continue
         names.append(name)
         payload = archive.read(entry)
+        expected_vendor_digest = PINNED_VENDOR_BINARY_SHA256.get(name)
+        if expected_vendor_digest:
+            actual_vendor_digest = hashlib.sha256(payload).hexdigest()
+            if actual_vendor_digest != expected_vendor_digest:
+                unsafe.append(f"vendor-checksum:{name}")
+            continue
         is_text = _should_scan_text(name)
         if is_text:
             if entry.file_size > MAX_TEXT_ENTRY_SIZE:

@@ -4,12 +4,19 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('assets\\app_icon_v2.ico', 'assets'), ('assets\\app_brand_v2_40.png', 'assets'), ('assets\\app_icon_v2_64.png', 'assets')]
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('yt_dlp')
+EXCLUDED_DATA_SUFFIXES = ('.py', '.pyc', '.dist-info/delvewheel')
 # The modules are bundled through hiddenimports/PYZ. Shipping upstream .py/.pyc
 # data would expose extractor fixtures and API test constants without helping runtime.
-datas += [entry for entry in tmp_ret[0] if not entry[0].lower().endswith(('.py', '.pyc'))]
-binaries += tmp_ret[1]
-hiddenimports += tmp_ret[2]
+# DELVEWHEEL records third-party wheel build paths and is not required at runtime.
+for package in ('yt_dlp', 'curl_cffi'):
+    tmp_ret = collect_all(package)
+    datas += [
+        entry
+        for entry in tmp_ret[0]
+        if not entry[0].replace('\\', '/').lower().endswith(EXCLUDED_DATA_SUFFIXES)
+    ]
+    binaries += tmp_ret[1]
+    hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -25,6 +32,13 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# PyInstaller auto-collects distribution metadata after the package data above.
+# DELVEWHEEL contains third-party CI paths and has no runtime purpose.
+a.datas = [
+    entry
+    for entry in a.datas
+    if not entry[0].replace('\\', '/').lower().endswith('.dist-info/delvewheel')
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
