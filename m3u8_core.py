@@ -43,7 +43,7 @@ USER_AGENT = (
 )
 
 DIRECT_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".m4v", ".flv", ".avi", ".wmv"}
-HISTORY_ACTIVE_STATES = {"preparing", "downloading", "paused"}
+HISTORY_ACTIVE_STATES = {"queued", "preparing", "downloading", "paused"}
 HISTORY_FINAL_STATES = {"completed", "failed", "stopped", "interrupted"}
 HISTORY_STATES = HISTORY_ACTIVE_STATES | HISTORY_FINAL_STATES
 _HTTP_LOCAL = threading.local()
@@ -261,7 +261,7 @@ class UserFacingError:
 
 
 class DownloadHistoryStore:
-    """Persist a bounded task library with atomic replacement and backup recovery. @codex-comment"""
+    """Persist unfinished tasks and bounded completed history with atomic backup recovery."""
 
     def __init__(self, path: Path, limit: int = HISTORY_RECORD_LIMIT) -> None:
         self.path = path
@@ -296,7 +296,19 @@ class DownloadHistoryStore:
                 continue
             if record.record_id:
                 result.append(record)
-        return sorted(result, key=lambda item: item.updated_at, reverse=True)[: self.limit]
+        return self._retained_records(result)
+
+    def _retained_records(self, records: Iterable[DownloadRecord]) -> list[DownloadRecord]:
+        ordered = sorted(records, key=lambda item: item.updated_at, reverse=True)
+        completed = 0
+        retained = []
+        for record in ordered:
+            if record.status == "completed":
+                completed += 1
+                if completed > self.limit:
+                    continue
+            retained.append(record)
+        return retained
 
     def load(self) -> list[DownloadRecord]:
         with self._transaction():
@@ -332,7 +344,7 @@ class DownloadHistoryStore:
 
     def _save_unlocked(self, records: Iterable[DownloadRecord]) -> None:
         normalized = [DownloadRecord.from_dict(asdict(item)) for item in records]
-        ordered = sorted(normalized, key=lambda item: item.updated_at, reverse=True)[: self.limit]
+        ordered = self._retained_records(normalized)
         payload = {"version": 1, "records": [asdict(item) for item in ordered]}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self.path.with_name(
@@ -363,11 +375,16 @@ class DownloadHistoryStore:
             self._save_unlocked(records)
 
     def upsert(self, record: DownloadRecord) -> list[DownloadRecord]:
+        return self.upsert_many([record])
+
+    def upsert_many(self, updates: Iterable[DownloadRecord]) -> list[DownloadRecord]:
+        """Merge one queue atomically without discarding another process's records."""
+        updates = {item.record_id: item for item in updates}
         with self._transaction():
-            records = [item for item in self._load_unlocked() if item.record_id != record.record_id]
-            records.insert(0, record)
+            records = [item for item in self._load_unlocked() if item.record_id not in updates]
+            records = self._retained_records([*updates.values(), *records])
             self._save_unlocked(records)
-            return records[: self.limit]
+            return records
 
     def clear_completed(self) -> list[DownloadRecord]:
         with self._transaction():

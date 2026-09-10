@@ -4,6 +4,11 @@
 
 ### Added
 
+- Debounced media search and natural title sorting, with visible selection order used for serial downloads.
+- Atomic pre-registration of every queued output and a same-session unfinished-queue retry action that preserves paths and record IDs.
+- Queued/unfinished history filters; unfinished records are retained independently of the completed-history limit.
+- Bounded progress transitions, explicit busy phases and a reduced-motion preference for the current session.
+
 - Baidu Netdisk `/s/` share recognition and complete-share batch downloads through a user-authorized BaiduPCS-Go connector.
 - A dedicated Baidu connector login action that opens an isolated console without exposing account input to the desktop process.
 - Hash-pinned BaiduPCS-Go v4.0.2 packaging, executable integrity verification, and bundled Apache-2.0 license text.
@@ -13,6 +18,9 @@
 - Browser TLS impersonation support for yt-dlp generic webpage discovery through the packaged curl_cffi transport.
 
 ### Improved
+
+- Unknown-size transfers no longer display a fabricated completion percentage; pause, stop and terminal events cancel progress motion.
+- Pending queue entries survive stop/restart, and failure to persist the queue prevents download startup.
 
 - Isolate HLS partial-export completion/errors from the queue lifecycle, capture the requested job, and block duplicate export requests.
 - Reject empty HLS exports and zero-byte segments during final assembly; serialize partial/final output with cache cleanup and clean unique temporary output files after failed exports.
@@ -36,7 +44,7 @@
 - Serialize history transactions across processes and recover structurally invalid JSON from a valid backup without overwriting that backup.
 - Reject PikPak refreshes that change the file identity or media type instead of saving an HLS manifest as a video.
 - Direct-media continuation keeps requesting bounded chunks when a valid `206` response omits the total size, and publishes only after the server explicitly confirms the final byte.
-- Local history now retains up to 2000 recent tasks and can recover from a valid atomic backup if the primary JSON file is interrupted or corrupted.
+- Local history retains up to 2000 completed tasks plus all unfinished tasks, and can recover from a valid atomic backup if the primary JSON file is interrupted or corrupted.
 - Failed, stopped, and interrupted history records can now re-analyze their privacy-safe source, match the original media, reuse the same task/output identity, and continue from local recovery data.
 - Native HLS retries now use a stable media cache key and adopt compatible URL-keyed legacy caches when temporary playlist signatures change.
 - Newly recorded YouTube tasks keep a query-free canonical video-ID path so history retry does not persist signed or unrelated query parameters.

@@ -70,6 +70,11 @@ def desktop_ui(_desktop_window, tmp_path):
     app.current_job = None
     app.current_record_id = ""
     app.partial_export_job = None
+    app._queue_entries = []
+    app._queue_source = ""
+    app._progress_paused = False
+    app.reduce_motion_var.set(False)
+    app._set_progress_value(0, animate=False)
     app.queue_stop_event.clear()
     app.history_records = []
     app.history_store = m3u8_desktop_app.DownloadHistoryStore(tmp_path / "history.json")
@@ -191,7 +196,7 @@ def test_queue_item_start_resets_previous_progress(desktop_ui, tmp_path):
             "total": 3,
         },
     )
-    assert app.progress["value"] == 0
+    assert app._progress_target == 0 and str(app.progress["mode"]) == "indeterminate"
     assert app.segment_total == 0
     assert "队列 2/3" in app.progress_detail_var.get()
 
@@ -376,7 +381,7 @@ def test_new_queue_item_resets_old_progress_and_controls(desktop_ui):
     app._handle_event("queue_item_started", {
         "candidate": app.candidates[1], "output": "demo.mp4", "index": 2, "total": 3,
     })
-    assert float(app.progress["value"]) == 0
+    assert app._progress_target == 0 and str(app.progress["mode"]) == "indeterminate"
     assert app.segment_total == 0
     assert app.pause_button.instate(["disabled"])
     assert app.pause_button.cget("text") == "暂停"
@@ -1677,3 +1682,216 @@ def _ico_sizes(path: Path) -> set[tuple[int, int]]:
         width, height = struct.unpack("BB", data[6 + index * 16 : 8 + index * 16])
         sizes.add((width or 256, height or 256))
     return sizes
+
+
+def test_candidate_filter_drops_hidden_selection_and_restores_rows(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app, 125)
+    app._select_all_candidates()
+    app.candidate_query_var.set("EPISODE 012")
+    app._apply_candidate_filter()
+    assert len(app._selected_candidates()) == 1
+    assert app.candidate_tree.get_children() == ("12",)
+    app.candidate_query_var.set("no match at all")
+    app._apply_candidate_filter()
+    assert not app._selected_candidates()
+    assert app.start_button.instate(["disabled"])
+    assert app.select_all_button.instate(["disabled"])
+    app.candidate_query_var.set("")
+    app._apply_candidate_filter()
+    assert len(app.candidate_tree.get_children()) == 125
+    assert not app._selected_candidates()
+
+
+def test_natural_sort_controls_actual_download_order(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app._on_analysis_done([replace(item, title=title) for item, title in
+                           zip(app.candidates, ("Episode 10", "Episode 2", "Episode 1"))])
+    app.candidate_sort_var.set("标题升序")
+    app._apply_candidate_filter()
+    app._select_all_candidates()
+    assert [item.title for item in app._selected_candidates()] == ["Episode 1", "Episode 2", "Episode 10"]
+    workers = []
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: workers.append(kw)))
+    app._start_download()
+    assert [item[0].title for item in workers[0]["args"][0]] == ["Episode 1", "Episode 2", "Episode 10"]
+
+
+def test_filter_is_flushed_before_download_and_busy_filter_is_frozen(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app._select_all_candidates()
+    workers = []
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: workers.append(kw)))
+    app.candidate_query_var.set("001")
+    app._start_download()
+    assert len(workers[0]["args"][0]) == 1
+    assert workers[0]["args"][0][0][0].title == "Episode 001"
+    app.candidate_query_var.set("002")
+    app._apply_candidate_filter()
+    assert app.candidate_tree.get_children() == ("1",)
+    assert app.candidate_search.instate(["disabled"])
+
+
+def test_clear_source_removes_detached_rows_and_retry_context(desktop_ui):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.candidate_query_var.set("002")
+    app._apply_candidate_filter()
+    assert app.candidate_tree.exists("0")
+    app.url_var.set("https://example.com/new")
+    assert not app.candidate_tree.exists("0")
+    assert not app._queue_entries
+    assert app.retry_queue_button.instate(["disabled"])
+
+
+def test_whole_queue_saved_before_worker_start_and_restart_recovers_it(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app, 125)
+    app._select_all_candidates()
+    captured = []
+    def start():
+        captured.extend(app.history_store.load())
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: SimpleNamespace(start=start))
+    app._start_download()
+    assert len(captured) == 125 and {r.status for r in captured} == {"queued"}
+    assert [r.record_id for r in captured] == [entry[2] for entry in app._queue_entries]
+    restored = app._load_history()
+    assert len(restored) == 125 and {r.status for r in restored} == {"interrupted"}
+    assert {r.output_path for r in captured} == {r.output_path for r in restored}
+
+
+def test_history_write_failure_prevents_download(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    monkeypatch.setattr(app.history_store, "upsert_many", lambda _records: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: pytest.fail("must not start without queue journal"))
+    app._start_download()
+    assert not app.is_downloading and not app._queue_entries
+
+
+def test_retry_unfinished_preserves_ids_paths_and_excludes_completed(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app._select_all_candidates()
+    workers = []
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: workers.append(kw)))
+    app._start_download()
+    original = list(app._queue_entries)
+    for index in (1, 2):
+        candidate, path, record_id = original[index - 1]
+        app._handle_event("queue_item_started", {"candidate": candidate, "output": str(path), "index": index, "total": 3})
+        assert app.current_record_id == record_id
+        app._handle_event("queue_item_completed" if index == 1 else "queue_item_failed",
+                          {"output": str(path), "error": HlsError("network timeout")})
+    app._handle_event("queue_finished", {"completed": 1, "failed": 1, "total": 3, "stopped": True})
+    records = {r.record_id: r for r in app.history_store.load()}
+    assert [records[item[2]].status for item in original] == ["completed", "failed", "stopped"]
+    assert not app.retry_queue_button.instate(["disabled"])
+    changed_directory = Path(app.output_dir_var.get()) / "changed"
+    app.output_dir_var.set(str(changed_directory))
+    app.file_name_var.set("renamed.mp4")
+    app._retry_unfinished_queue()
+    assert app._queue_entries == original[1:]
+    assert not changed_directory.exists()
+    assert workers[1]["args"][0] == [(candidate, path) for candidate, path, _id in original[1:]]
+
+
+def test_queue_retry_requires_reentry_of_cleared_share_code(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.access_code_var.set("demo-code")
+    app._persist_queue([(app.candidates[0], Path(app.output_dir_var.get()) / "demo.mp4")])
+    app.access_code_var.set("")
+    monkeypatch.setattr(app, "_start_download", lambda **kw: pytest.fail("must ask for code first"))
+    app._retry_unfinished_queue()
+    assert app.advanced_visible
+    assert "提取码" in app.notice_title.cget("text")
+    assert "demo-code" not in app.history_store.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status,expected", [("queued", True), ("failed", True), ("stopped", True),
+                                           ("downloading", True), ("preparing", True), ("paused", True), ("completed", False)])
+def test_unfinished_history_filter(status, expected):
+    record = DownloadRecord("r", "Demo", "direct", "https://example.com", "example.com", "demo.mp4", status)
+    assert _history_record_matches(record, "", "未完成") is expected
+
+
+def test_progress_interpolation_is_bounded_and_terminal_cancels_timer(desktop_ui, monkeypatch):
+    app = desktop_ui
+    callbacks = {}
+    monkeypatch.setattr(app, "after", lambda _ms, callback: callbacks.setdefault("pending", callback) and "timer")
+    monkeypatch.setattr(app, "after_cancel", lambda _id: callbacks.pop("pending", None))
+    app._set_progress_value(80)
+    values = [float(app.progress["value"])]
+    for _ in range(30):
+        callback = callbacks.pop("pending", None)
+        if callback is None:
+            break
+        callback()
+        values.append(float(app.progress["value"]))
+    assert values == sorted(values) and values[0] > 0 and values[-1] == 80
+    assert not app._motion_after_id
+    app._set_progress_value(90)
+    assert app._motion_after_id
+    app._set_progress_value(100, animate=False)
+    assert not app._motion_after_id and not callbacks
+    assert float(app.progress["value"]) == 100
+
+
+def test_reduced_motion_and_pause_disable_motion(desktop_ui):
+    app = desktop_ui
+    app._set_progress_busy(True)
+    assert str(app.progress["mode"]) == "indeterminate"
+    app.reduce_motion_var.set(True)
+    app._on_motion_preference_changed()
+    assert str(app.progress["mode"]) == "determinate"
+    app._set_progress_value(45)
+    assert float(app.progress["value"]) == 45 and not app._motion_after_id
+    app.reduce_motion_var.set(False)
+    app._handle_event("paused", {})
+    app._update_progress({"done": 50, "total": 100, "bytes_done": 50})
+    assert float(app.progress["value"]) == 50 and not app._motion_after_id
+    app._stop_download()
+    app._set_progress_busy(True)
+    assert str(app.progress["mode"]) == "determinate"
+
+
+def test_unknown_size_progress_never_claims_completion(desktop_ui):
+    app = desktop_ui
+    app._update_progress({"done": 1024, "total": 0, "bytes_done": 1024})
+    assert app.current_progress_value == 0
+    assert "100%" not in app.progress_detail_var.get()
+    assert "大小未知" in app.progress_detail_var.get()
+    assert str(app.progress["mode"]) == "indeterminate"
+    app._handle_event("queue_finished", {"completed": 0, "failed": 1, "total": 1})
+    assert str(app.progress["mode"]) == "determinate" and not app._motion_after_id
+
+
+def test_unfinished_retry_skips_file_appearing_after_failure(desktop_ui, tmp_path):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    output = tmp_path / "already-saved.mp4"
+    app._persist_queue([(app.candidates[0], output)])
+    output.write_bytes(b"synthetic complete output")
+    app._sync_queue_retry()
+    assert not app._unfinished_queue_entries()
+    assert app.retry_queue_button.instate(["disabled"])
+
+
+def test_new_analysis_after_stop_starts_busy_motion(desktop_ui, monkeypatch):
+    app = desktop_ui
+    _render_demo_candidates(app)
+    app.queue_stop_event.set()
+    app._progress_paused = True
+    monkeypatch.setattr(m3u8_desktop_app.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: None))
+    app._start_analyze()
+    assert not app.queue_stop_event.is_set() and not app._progress_paused
+    assert str(app.progress["mode"]) == "indeterminate"
+    app._handle_event("analysis_error", {"error": HlsError("network timeout")})
+    assert str(app.progress["mode"]) == "determinate" and not app._motion_after_id
+
+
+def test_positive_subsecond_eta_does_not_claim_zero_seconds():
+    assert m3u8_desktop_app._format_eta(0.1) == "不到 1 秒"

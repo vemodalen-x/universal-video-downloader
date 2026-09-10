@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,7 @@ MAX_SEGMENT_BLOCKS = 160
 MAX_LOG_LINES = 2000
 BATCH_ITEM_MAX_ATTEMPTS = 3
 BATCH_ITEM_RETRY_BACKOFF_SECONDS = 1.5
-HISTORY_RETRY_STATES = frozenset({"failed", "stopped", "interrupted"})
+HISTORY_RETRY_STATES = frozenset({"queued", "failed", "stopped", "interrupted"})
 
 
 class UniversalVideoDownloaderApp(tk.Tk):
@@ -88,6 +89,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._analysis_url = ""
         self.analyzed_url = ""
         self._selection_ids: tuple[str, ...] = ()
+        self._candidate_ids: tuple[str, ...] = ()
+        self._filter_after_id = None
+        self._motion_after_id = None
+        self._progress_target = 0.0
+        self._progress_busy = False
+        self._progress_paused = False
+        self._queue_entries: list[tuple[VideoCandidate, Path, str]] = []
+        self._queue_source = ""
+        self._queue_requires_code = False
 
         self.history_store = DownloadHistoryStore(default_history_path())
         self.history_records = self._load_history()
@@ -128,10 +138,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_filter_var = tk.StringVar(value="全部状态")
         self.history_summary_var = tk.StringVar(value="0 个任务")
         self.history_detail_var = tk.StringVar(value="请选择任务查看状态")
+        self.candidate_query_var = tk.StringVar()
+        self.candidate_sort_var = tk.StringVar(value="原始顺序")
+        self.reduce_motion_var = tk.BooleanVar(value=False)
 
         self._configure_style()
         self._build_ui()
         self.url_var.trace_add("write", self._on_source_changed)
+        self.candidate_query_var.trace_add("write", self._schedule_candidate_filter)
         self._sync_input_controls()
         self._refresh_history()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -145,7 +159,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         changed = False
         restored: list[DownloadRecord] = []
         for record in records:
-            if record.status in {"preparing", "downloading", "paused"}:
+            if record.status in {"queued", "preparing", "downloading", "paused"}:
                 record = replace(record, status="interrupted", updated_at=time.time())
                 changed = True
             restored.append(record)
@@ -344,6 +358,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.baidupan_button.grid(row=1, column=4, sticky=tk.E, pady=(10, 0))
         self.advanced_done_button = ttk.Button(self.advanced_frame, text="完成", command=self._toggle_advanced)
         self.advanced_done_button.grid(row=2, column=4, sticky=tk.E, pady=(14, 0))
+        self.reduce_motion_check = ttk.Checkbutton(
+            self.advanced_frame, text="减少动效", variable=self.reduce_motion_var,
+            command=self._on_motion_preference_changed,
+        )
+        self.reduce_motion_check.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
         self.advanced_error_var = tk.StringVar()
         ttk.Label(self.advanced_frame, textvariable=self.advanced_error_var, style="Muted.TLabel", foreground="#B4232A", wraplength=420).grid(
             row=2, column=0, columnspan=4, sticky=tk.W, pady=(14, 0)
@@ -358,7 +377,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         candidates_frame = ttk.Frame(workspace, style="Surface.TFrame", padding=14)
         candidates_frame.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 14))
         candidates_frame.columnconfigure(0, weight=1)
-        candidates_frame.rowconfigure(2, weight=1)
+        candidates_frame.rowconfigure(3, weight=1)
 
         heading = ttk.Frame(candidates_frame, style="Surface.TFrame")
         heading.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
@@ -371,7 +390,18 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.select_all_button.grid(row=0, column=3, padx=(8, 0))
         self.deselect_button = ttk.Button(heading, text="取消选择", width=8, style="Link.TButton", command=self._deselect_candidates, state=tk.DISABLED)
         self.deselect_button.grid(row=0, column=4, padx=(8, 0))
-        ttk.Label(candidates_frame, textvariable=self.selection_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(7, 10))
+        search_row = ttk.Frame(candidates_frame, style="Surface.TFrame")
+        search_row.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        search_row.columnconfigure(1, weight=1)
+        ttk.Label(search_row, text="搜索", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 8))
+        self.candidate_search = ttk.Entry(search_row, textvariable=self.candidate_query_var)
+        self.candidate_search.grid(row=0, column=1, sticky=tk.EW)
+        self.candidate_search.bind("<Escape>", lambda _event: self.candidate_query_var.set(""))
+        self.candidate_sort = ttk.Combobox(search_row, textvariable=self.candidate_sort_var,
+                                          values=("原始顺序", "标题升序", "标题降序"), state="readonly", width=10)
+        self.candidate_sort.grid(row=0, column=2, padx=(8, 0))
+        self.candidate_sort.bind("<<ComboboxSelected>>", lambda _event: self._apply_candidate_filter())
+        ttk.Label(candidates_frame, textvariable=self.selection_var, style="Muted.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(5, 6))
 
         columns = ("title", "quality", "format", "duration", "origin")
         self.candidate_tree = ttk.Treeview(candidates_frame, columns=columns, show="headings", selectmode="extended", height=8)
@@ -387,8 +417,8 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.candidate_tree.column(key, width=width, minwidth=65, stretch=(key == "title"))
         tree_scroll = ttk.Scrollbar(candidates_frame, orient=tk.VERTICAL, command=self.candidate_tree.yview)
         self.candidate_tree.configure(yscrollcommand=tree_scroll.set)
-        self.candidate_tree.grid(row=2, column=0, sticky=tk.NSEW)
-        tree_scroll.grid(row=2, column=1, sticky=tk.NS)
+        self.candidate_tree.grid(row=3, column=0, sticky=tk.NSEW)
+        tree_scroll.grid(row=3, column=1, sticky=tk.NS)
         self.candidate_empty_label = ttk.Label(
             candidates_frame,
             text="暂无媒体",
@@ -492,8 +522,18 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
         progress_tab.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(progress_tab, mode="determinate", maximum=100)
-        self.progress.grid(row=0, column=0, sticky=tk.EW)
-        ttk.Label(progress_tab, textvariable=self.progress_detail_var, style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        self.progress.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
+        progress_actions = ttk.Frame(progress_tab, style="Surface.TFrame")
+        progress_actions.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
+        progress_actions.columnconfigure(0, weight=1)
+        self.progress_detail_label = ttk.Label(progress_actions, textvariable=self.progress_detail_var,
+                                               style="Muted.TLabel", width=1, wraplength=700)
+        self.progress_detail_label.grid(row=0, column=0, sticky=tk.EW)
+        self.retry_queue_button = ttk.Button(progress_tab, text="重试未完成", style="Compact.TButton",
+                                             command=self._retry_unfinished_queue, state=tk.DISABLED)
+        self.retry_queue_button.grid(row=2, column=1, padx=(8, 0))
+        progress_actions.bind("<Configure>", lambda event: self.progress_detail_label.configure(
+            wraplength=max(180, event.width - 20)))
         self.segment_canvas = tk.Canvas(progress_tab, height=34, bg="#FFFFFF", highlightthickness=0)
         self.segment_canvas.grid(row=2, column=0, sticky=tk.EW, pady=(4, 0))
         self.segment_canvas.bind("<Configure>", lambda _event: self._redraw_segments())
@@ -553,7 +593,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.history_filter = ttk.Combobox(
             toolbar,
             textvariable=self.history_filter_var,
-            values=("全部状态", "下载中", "已完成", "需重试", "已暂停", "已中断", "已停止"),
+            values=("全部状态", "未完成", "排队中", "下载中", "已完成", "需重试", "已暂停", "已中断", "已停止"),
             state="readonly",
             width=9,
         )
@@ -641,16 +681,21 @@ class UniversalVideoDownloaderApp(tk.Tk):
         if self.is_analyzing or self.is_downloading:
             return
         self._clear_candidates()
+        self._queue_entries = []
+        self._queue_source = ""
+        self._sync_queue_retry()
         self.status_var.set("待解析新链接" if url else "准备就绪")
         self.selection_var.set("尚未解析")
         self.progress_detail_var.set("尚未开始任务")
-        self.progress.stop()
-        self.progress.configure(mode="determinate", value=0)
+        self._set_progress_value(0, animate=False)
         self._draw_segments(0)
         self._hide_notice()
 
     def _sync_input_controls(self) -> None:
         busy = self.is_analyzing or self.is_downloading
+        self.candidate_search.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self.candidate_sort.configure(state=tk.DISABLED if busy else "readonly")
+        self._sync_queue_retry()
         self.candidate_tree.configure(selectmode="none" if busy else "extended")
         for control in self._input_controls:
             control.configure(state=tk.DISABLED if busy else tk.NORMAL)
@@ -750,13 +795,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
         self._hide_notice()
         self._analysis_url = url
+        self.queue_stop_event.clear()
+        self._progress_paused = False
         self.advanced_error_var.set("")
         self._set_advanced_visible(False)
         self._set_busy_analyzing(True)
         self._clear_candidates()
-        self.progress.stop()
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(12)
+        self._set_progress_value(0, animate=False)
+        self._set_progress_busy(True)
         self.progress_detail_var.set("正在检查页面、媒体地址和通用解析器")
         self._draw_segments(0)
         self._log("开始解析媒体：" + redact_url(url))
@@ -778,7 +824,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         except Exception as exc:
             self.event_buffer.put("analysis_error", {"error": exc})
 
-    def _start_download(self) -> None:
+    def _start_download(self, *, retry_unfinished: bool = False) -> None:
         """Deduplicate selected media, resolve existing-output policy, and start the serial queue. @codex-comment"""
 
         if self.is_analyzing or self.is_downloading:
@@ -787,7 +833,10 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._show_notice("warning", "请重新解析链接", "当前链接已改变，原来的媒体列表不再适用。")
             self.url_entry.focus_set()
             return
-        selected_candidates = self._selected_candidates()
+        if self.__dict__.get("_filter_after_id") is not None:
+            self._apply_candidate_filter()
+        retry_entries = self._unfinished_queue_entries() if retry_unfinished else []
+        selected_candidates = [item[0] for item in retry_entries] if retry_unfinished else self._selected_candidates()
         if not selected_candidates:
             self.history_retry_record_id = ""
             self._show_notice("warning", "尚未选择媒体", "先解析链接，然后选择一个或多个媒体条目。")
@@ -797,18 +846,19 @@ class UniversalVideoDownloaderApp(tk.Tk):
         if concurrency is None:
             return
 
-        if not self.output_dir_var.get().strip():
+        if not retry_unfinished and not self.output_dir_var.get().strip():
             self._show_notice("warning", "请选择保存目录", "保存目录不能为空。")
             self.output_dir_entry.focus_set()
             return
         output_dir = Path(self.output_dir_var.get()).expanduser()
         try:
-            output_dir.mkdir(parents=True, exist_ok=True)
+            if not retry_unfinished:
+                output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.history_retry_record_id = ""
             self._show_error(classify_error(exc))
             return
-        queue = _plan_output_paths(
+        queue = [(candidate, path) for candidate, path, _record_id in retry_entries] if retry_unfinished else _plan_output_paths(
             candidates,
             output_dir,
             self.file_name_var.get(),
@@ -821,6 +871,11 @@ class UniversalVideoDownloaderApp(tk.Tk):
             total_skipped = repeated_selection_count + skipped_existing_count
             self._show_notice("info", "没有需要下载的项目", f"已跳过 {total_skipped} 个重复或已存在的视频。")
             self._log(f"重复检测已跳过 {total_skipped} 个条目")
+            return
+        try:
+            self._persist_queue(queue)
+        except OSError as exc:
+            self._show_error(classify_error(exc))
             return
         if len(queue) == 1 and queue[0][0].source_type != "baidupan":
             self.file_name_var.set(queue[0][1].name)
@@ -842,11 +897,12 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.queue_completed = 0
         self.queue_failed = 0
         self.queue_stop_event.clear()
+        self._progress_paused = False
         self._reset_progress_estimator()
         self._set_downloading_state(True)
         self._draw_segments(0)
-        self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=100, value=0)
+        self._set_progress_value(0, animate=False)
+        self._set_progress_busy(True)
         self.status_var.set("正在准备下载")
         self.progress_detail_var.set(f"正在建立下载队列，共 {len(queue)} 项")
         self._log(f"准备下载 {len(queue)} 个媒体条目")
@@ -865,6 +921,47 @@ class UniversalVideoDownloaderApp(tk.Tk):
             daemon=True,
         )
         self.download_thread.start()
+
+    def _persist_queue(self, queue: list[tuple[VideoCandidate, Path]]) -> None:
+        """Save every planned item before launching any worker, preserving retry IDs and paths."""
+        reusable = {(_candidate_media_key(candidate), str(path)): record_id
+                    for candidate, path, record_id in self._queue_entries}
+        records = []
+        entries = []
+        queued_at = time.time()
+        for candidate, path in queue:
+            key = (_candidate_media_key(candidate), str(path))
+            record_id = reusable.get(key) or (self.history_retry_record_id if len(queue) == 1 else "") or uuid.uuid4().hex
+            records.append(replace(self._make_history_record(candidate, path, record_id, "queued"), updated_at=queued_at))
+            entries.append((candidate, path, record_id))
+        self.history_records = self.history_store.upsert_many(records)
+        self._queue_entries = entries
+        self._queue_source = self.url_var.get().strip()
+        self._queue_requires_code = bool(self.access_code_var.get().strip())
+        self._refresh_history()
+
+    def _unfinished_queue_entries(self) -> list[tuple[VideoCandidate, Path, str]]:
+        if self._queue_source != self.url_var.get().strip():
+            return []
+        statuses = {record.record_id: record.status for record in self.history_records}
+        return [entry for entry in self._queue_entries if statuses.get(entry[2]) in HISTORY_RETRY_STATES
+                and (entry[0].source_type == "baidupan" or not entry[1].exists())]
+
+    def _sync_queue_retry(self) -> None:
+        entries = self._unfinished_queue_entries()
+        enabled = bool(entries) and not self.is_downloading and not self.is_analyzing
+        self.retry_queue_button.configure(state=tk.NORMAL if enabled else tk.DISABLED,
+                                          text=f"重试未完成 ({len(entries)})" if entries else "重试未完成")
+
+    def _retry_unfinished_queue(self) -> None:
+        if self.is_downloading or self.is_analyzing or not self._unfinished_queue_entries():
+            return
+        if self._queue_requires_code and not self.access_code_var.get().strip():
+            self._show_notice("warning", "需要提取码", "提取码已清除，重新输入后点击重试未完成。")
+            self._set_advanced_visible(True)
+            self.access_code_entry.focus_set()
+            return
+        self._start_download(retry_unfinished=True)
 
     def _validated_concurrency(self) -> int | None:
         try:
@@ -1049,6 +1146,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
     def _stop_download(self) -> None:
         self.queue_stop_event.set()
+        self._set_progress_value(self.current_progress_value, animate=False)
         self.pause_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.DISABLED)
         self.partial_button.configure(state=tk.DISABLED)
@@ -1083,30 +1181,65 @@ class UniversalVideoDownloaderApp(tk.Tk):
         return candidates[0] if candidates else None
 
     def _selected_candidates(self) -> list[VideoCandidate]:
-        selection = self.candidate_tree.selection()
+        selection = set(self.candidate_tree.selection())
         if not selection:
             return []
         indices: list[int] = []
-        for item in selection:
+        for item in self.candidate_tree.get_children():
+            if item not in selection:
+                continue
             try:
                 index = int(item)
             except (TypeError, ValueError):
                 continue
             if 0 <= index < len(self.candidates):
                 indices.append(index)
-        return [self.candidates[index] for index in sorted(indices)]
+        return [self.candidates[index] for index in indices]
+
+    def _schedule_candidate_filter(self, *_args) -> None:
+        if self._filter_after_id is not None:
+            self.after_cancel(self._filter_after_id)
+        self._filter_after_id = self.after(150, self._apply_candidate_filter)
+
+    def _apply_candidate_filter(self) -> None:
+        if self._filter_after_id is not None:
+            self.after_cancel(self._filter_after_id)
+            self._filter_after_id = None
+        if self.is_analyzing or self.is_downloading:
+            return
+        words = self.candidate_query_var.get().casefold().split()
+        indices = [i for i, candidate in enumerate(self.candidates)
+                   if all(word in f"{candidate.title} {_candidate_origin_label(candidate)}".casefold() for word in words)]
+        order = self.candidate_sort_var.get()
+        if order != "原始顺序":
+            indices.sort(key=lambda i: _natural_title_key(self.candidates[i].title), reverse=order == "标题降序")
+        visible = tuple(str(i) for i in indices)
+        visible_set = set(visible)
+        selection = tuple(i for i in self.candidate_tree.selection() if i in visible_set)
+        self.candidate_tree.selection_set(selection)
+        self.candidate_tree.set_children("", *visible)
+        self.candidate_count_var.set(f"{len(visible)} / {len(self.candidates)} 项")
+        if visible:
+            self.candidate_empty_label.place_forget()
+        elif self.candidates:
+            self.candidate_empty_label.configure(text="没有匹配的媒体")
+            self.candidate_empty_label.place(relx=0.5, rely=0.78, anchor=tk.CENTER)
+        self._sync_selection()
+        self.select_all_button.configure(state=tk.NORMAL if visible else tk.DISABLED)
+        self.best_button.configure(state=tk.NORMAL if visible else tk.DISABLED)
 
     def _select_best_candidate(self) -> None:
         if not self.candidates or self.is_analyzing or self.is_downloading:
             return
+        items = self.candidate_tree.get_children()
+        if not items:
+            return
         if self.candidates[0].playlist_count > 1:
-            items = tuple(str(index) for index in range(len(self.candidates)))
             self.candidate_tree.selection_set(items)
             self.candidate_tree.focus(items[0])
             self._sync_selection()
             return
-        best_index, _best = max(enumerate(self.candidates), key=lambda item: candidate_score(item[1]))
-        iid = str(best_index)
+        iid = max(items, key=lambda item: candidate_score(self.candidates[int(item)]))
         self.candidate_tree.selection_set(iid)
         self.candidate_tree.focus(iid)
         self.candidate_tree.see(iid)
@@ -1234,6 +1367,15 @@ class UniversalVideoDownloaderApp(tk.Tk):
         )
 
     def _clear_candidates(self) -> None:
+        if self._filter_after_id is not None:
+            self.after_cancel(self._filter_after_id)
+            self._filter_after_id = None
+        for item in self._candidate_ids:
+            if self.candidate_tree.exists(item):
+                self.candidate_tree.delete(item)
+        self._candidate_ids = ()
+        self.candidate_query_var.set("")
+        self.candidate_sort_var.set("原始顺序")
         self.candidates = []
         self.analyzed_url = ""
         self._selection_ids = ()
@@ -1377,6 +1519,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self._sync_partial_button()
         if not active:
             self.pause_button.configure(text="暂停")
+            self._set_progress_value(self.current_progress_value, animate=False)
         self._sync_input_controls()
         self._sync_history_actions()
 
@@ -1403,8 +1546,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
             retry_record = self.pending_history_retry
             self.pending_history_retry = None
             self.access_code_var.set("")
-            self.progress.stop()
-            self.progress.configure(mode="determinate", value=0)
+            self._set_progress_value(0, animate=False)
             self._set_busy_analyzing(False)
             self.candidate_count_var.set("解析未完成")
             self.progress_detail_var.set("解析未完成")
@@ -1441,29 +1583,33 @@ class UniversalVideoDownloaderApp(tk.Tk):
             if payload["job"] is self.current_job:
                 self._set_downloading_state(True)
         elif event == "queue_item_started":
+            self._progress_paused = False
             candidate = payload["candidate"]
             output_path = Path(payload["output"])
             self.current_candidate = candidate
-            self.current_record_id = self.history_retry_record_id or uuid.uuid4().hex
+            index = int(payload.get("index", 1))
+            entry = self._queue_entries[index - 1] if 0 < index <= len(self._queue_entries) else None
+            self.current_record_id = (entry[2] if entry and entry[1] == output_path else "") or self.history_retry_record_id or uuid.uuid4().hex
             self.history_retry_record_id = ""
             self._reset_progress_estimator()
-            self.progress["value"] = 0
+            self._set_progress_value(0, animate=False)
+            self._set_progress_busy(True)
             self._draw_segments(0)
             self.pause_button.configure(text="暂停", state=tk.DISABLED)
             self.partial_button.configure(state=tk.DISABLED)
             self._create_history_record(candidate, output_path)
-            index = int(payload.get("index", 1))
             total = int(payload.get("total", 1))
             self.status_var.set(f"正在下载 {index}/{total}")
             self.progress_detail_var.set(f"队列 {index}/{total} · 正在准备 {output_path.name}")
             self._log(f"队列 {index}/{total}：{redact_url(candidate.url)}")
         elif event == "queue_item_completed":
             self.queue_completed += 1
-            self.progress["value"] = 100
+            self._set_progress_value(100, animate=False)
             output = Path(str(payload.get("output", "")))
             self._history_update(status="completed", progress=100.0, output_path=output, force=True)
             self._log("已完成：" + output.name)
         elif event == "queue_item_retry":
+            self._set_progress_busy(True)
             attempt = int(payload.get("attempt", 2))
             max_attempts = int(payload.get("max_attempts", BATCH_ITEM_MAX_ATTEMPTS))
             index = int(payload.get("index", 1))
@@ -1473,6 +1619,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.progress_detail_var.set(f"队列 {index}/{total} · 当前文件第 {attempt}/{max_attempts} 次尝试")
             self._log(f"当前文件上次尝试失败：{error.message}；开始第 {attempt}/{max_attempts} 次尝试", "warning")
         elif event == "queue_item_failed":
+            self._set_progress_value(self.current_progress_value, animate=False)
             self.queue_failed += 1
             error = classify_error(payload.get("error", "媒体下载未完成"))
             self._history_update(status="failed", error=error, force=True)
@@ -1485,6 +1632,13 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.access_code_var.set("")
             self._set_downloading_state(False)
             self.current_job = None
+            queued_ids = {entry[2] for entry in self._queue_entries}
+            pending = [replace(record, status="stopped") for record in self.history_records
+                       if record.record_id in queued_ids and record.status == "queued"]
+            if pending:
+                self.history_records = self.history_store.upsert_many(pending)
+                self._refresh_history()
+            self._sync_queue_retry()
             completed = int(payload.get("completed", 0))
             failed = int(payload.get("failed", 0))
             total = int(payload.get("total", 0))
@@ -1509,10 +1663,16 @@ class UniversalVideoDownloaderApp(tk.Tk):
         elif event == "progress":
             self._update_progress(payload)
         elif event == "paused":
+            self._progress_paused = True
+            self._paused_progress_busy = self._progress_busy
+            self._set_progress_value(self.current_progress_value, animate=False)
             self.pause_button.configure(text="继续")
             self.status_var.set("已暂停")
             self._history_update(status="paused", force=True)
         elif event == "resumed":
+            self._progress_paused = False
+            if self.__dict__.get("_paused_progress_busy"):
+                self._set_progress_busy(True)
             self.pause_button.configure(text="暂停")
             self.status_var.set("继续下载")
             self._history_update(status="downloading", force=True)
@@ -1539,13 +1699,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
                 self._log(f"部分媒体导出失败：{error.detail or error.message}", "warning")
                 self._show_notice("warning", "部分媒体暂未导出", "下载队列未受影响，可等待更多分片完成后重试；详情见活动日志。")
         elif event == "combining" and not payload.get("partial"):
+            self._set_progress_busy(True)
             self.status_var.set("正在封装媒体文件")
             self._log("开始生成输出文件")
         elif event == "combined" and not payload.get("partial"):
             self._log("输出文件已生成：" + Path(payload.get("output", "")).name)
         elif event == "completed":
             self._set_downloading_state(False)
-            self.progress["value"] = 100
+            self._set_progress_value(100, animate=False)
             self.status_var.set("下载完成")
             self.progress_detail_var.set("100% · 文件已写入保存位置")
             self._history_update(status="completed", progress=100.0, force=True)
@@ -1572,8 +1733,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _discard_stale_analysis(self) -> bool:
         if self._analysis_url == self.url_var.get().strip():
             return False
-        self.progress.stop()
-        self.progress.configure(mode="determinate", value=0)
+        self._set_progress_value(0, animate=False)
         self._clear_candidates()
         self._set_busy_analyzing(False)
         self.pending_history_retry = None
@@ -1586,14 +1746,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
 
         if self._discard_stale_analysis():
             return
-        self.progress.stop()
-        self.progress.configure(mode="determinate", value=0)
+        self._set_progress_value(0, animate=False)
         self.progress_detail_var.set("解析完成，等待开始下载")
         self._set_busy_analyzing(False)
         self._clear_candidates()
         self.analyzed_url = self._analysis_url
         self.advanced_error_var.set("")
         self.candidates = candidates
+        self._candidate_ids = tuple(str(i) for i in range(len(candidates)))
         self.candidate_count_var.set(f"共 {len(candidates)} 项")
         if not candidates:
             retry_record = self.pending_history_retry
@@ -1641,7 +1801,48 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self._log(f"发现 {len(candidates)} 个可下载媒体，已选择推荐项。")
             self._show_notice("success", "解析完成", f"找到 {len(candidates)} 个媒体版本，已按画质与码率排序。")
 
+    def _cancel_progress_motion(self) -> None:
+        if self._motion_after_id is not None:
+            self.after_cancel(self._motion_after_id)
+            self._motion_after_id = None
+
+    def _set_progress_busy(self, busy: bool) -> None:
+        self._cancel_progress_motion()
+        self.progress.stop()
+        self._progress_busy = busy
+        moving = busy and not self.reduce_motion_var.get() and not self._progress_paused and not self.queue_stop_event.is_set()
+        self.progress.configure(mode="indeterminate" if moving else "determinate",
+                                value=0 if busy else self._progress_target)
+        if moving:
+            self.progress.start(35)
+
+    def _set_progress_value(self, value: float, *, animate: bool = True) -> None:
+        self._cancel_progress_motion()
+        if self._progress_busy:
+            self._set_progress_busy(False)
+        self._progress_target = min(100.0, max(0.0, value))
+        shown = float(self.progress["value"])
+        if not animate or self.reduce_motion_var.get() or self._progress_paused or self.queue_stop_event.is_set() or shown >= self._progress_target:
+            self.progress["value"] = self._progress_target
+            return
+        self._animate_progress()
+
+    def _animate_progress(self) -> None:
+        self._motion_after_id = None
+        shown = float(self.progress["value"])
+        remaining = self._progress_target - shown
+        self.progress["value"] = self._progress_target if remaining < 0.1 else shown + remaining * 0.35
+        if remaining >= 0.1:
+            self._motion_after_id = self.after(16, self._animate_progress)
+
+    def _on_motion_preference_changed(self) -> None:
+        if self._progress_busy:
+            self._set_progress_busy(True)
+        else:
+            self._set_progress_value(self._progress_target, animate=False)
+
     def _reset_progress_estimator(self) -> None:
+        self._set_progress_value(0, animate=False)
         self.last_progress_bytes = 0
         self.last_progress_done = 0
         self.last_progress_time = time.monotonic()
@@ -1651,15 +1852,18 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.current_bytes_done = 0
 
     def _update_progress(self, payload: dict) -> None:
-        total = max(1, int(payload.get("total", 0)))
+        total = max(0, int(payload.get("total", 0)))
         done = max(0, int(payload.get("done", 0)))
         failed = max(0, int(payload.get("failed", 0)))
         downloading = max(0, int(payload.get("downloading", 0)))
         bytes_done = max(0, int(payload.get("bytes_done", 0)))
-        percent = min(100.0, done / total * 100)
+        percent = min(100.0, done / total * 100) if total else 0.0
         self.current_progress_value = percent
         self.current_bytes_done = max(self.current_bytes_done, bytes_done)
-        self.progress["value"] = percent
+        if total:
+            self._set_progress_value(percent)
+        elif not self._progress_busy:
+            self._set_progress_busy(True)
 
         now = time.monotonic()
         elapsed = max(0.05, now - self.last_progress_time)
@@ -1677,7 +1881,7 @@ class UniversalVideoDownloaderApp(tk.Tk):
         self.last_progress_time = now
 
         eta = (total - done) / self.smoothed_unit_rate if self.smoothed_unit_rate > 0 and done < total else 0
-        parts = [f"{percent:.0f}%", f"{done}/{total}", _format_size(bytes_done)]
+        parts = [f"{percent:.0f}%", f"{done}/{total}", _format_size(bytes_done)] if total else ["大小未知", _format_size(bytes_done)]
         if self.smoothed_speed > 0:
             parts.append(f"{_format_size(self.smoothed_speed)}/s")
         if eta > 0:
@@ -1753,24 +1957,28 @@ class UniversalVideoDownloaderApp(tk.Tk):
     def _create_history_record(self, candidate: VideoCandidate, output_path: Path) -> None:
         """Create or restart local history without persisting signed URLs or access credentials. @codex-comment"""
 
+        record = self._make_history_record(candidate, output_path, self.current_record_id)
+        self.history_records = self.history_store.upsert(record)
+        self._refresh_history()
+
+    def _make_history_record(self, candidate: VideoCandidate, output_path: Path,
+                             record_id: str, status: str = "preparing") -> DownloadRecord:
         source_url = _history_source_url(candidate)
         host = urlparse(source_url).hostname or ""
-        previous = next((item for item in self.history_records if item.record_id == self.current_record_id), None)
-        record = DownloadRecord(
-            record_id=self.current_record_id,
+        previous = next((item for item in self.history_records if item.record_id == record_id), None)
+        return DownloadRecord(
+            record_id=record_id,
             title=sanitize_file_name(candidate.title.split(" / ", 1)[0], "video"),
             source_type=candidate.source_type,
             source_url=source_url,
             source_host=host,
             output_path=str(output_path),
-            status="preparing",
+            status=status,
             media_key=_candidate_media_key(candidate),
             progress=previous.progress if previous else 0.0,
             bytes_done=previous.bytes_done if previous else 0,
             updated_at=time.time(),
         )
-        self.history_records = self.history_store.upsert(record)
-        self._refresh_history()
 
     def _history_update(
         self,
@@ -2011,6 +2219,14 @@ class UniversalVideoDownloaderApp(tk.Tk):
             self.current_job.stop()
         self.destroy()
 
+    def destroy(self) -> None:
+        self._cancel_progress_motion()
+        self.progress.stop()
+        if self._filter_after_id is not None:
+            self.after_cancel(self._filter_after_id)
+            self._filter_after_id = None
+        super().destroy()
+
 
 def _status_color(status: str) -> str:
     return {
@@ -2020,6 +2236,11 @@ def _status_color(status: str) -> str:
         "done": "#2BA471",
         "error": "#E5484D",
     }.get(status, "#DDE2EA")
+
+
+def _natural_title_key(title: str) -> tuple:
+    return tuple((1, int(part)) if part.isdigit() else (0, part.casefold())
+                 for part in re.split(r"(\d+)", title))
 
 
 def _format_duration(seconds: float) -> str:
@@ -2057,6 +2278,8 @@ def _format_size(value: float) -> str:
 
 
 def _format_eta(seconds: float) -> str:
+    if 0 < seconds < 1:
+        return "不到 1 秒"
     seconds = max(0, int(seconds))
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
@@ -2155,6 +2378,7 @@ def _subtitle_choice_map(candidates: list[VideoCandidate]) -> dict[str, tuple[st
 
 def _history_status_label(status: str) -> str:
     return {
+        "queued": "排队中",
         "preparing": "准备中",
         "downloading": "下载中",
         "paused": "已暂停",
@@ -2178,6 +2402,7 @@ def _history_type_label(source_type: str) -> str:
 
 def _history_filter_status(label: str) -> str | None:
     return {
+        "排队中": "queued",
         "下载中": "downloading",
         "已完成": "completed",
         "需重试": "failed",
@@ -2188,6 +2413,8 @@ def _history_filter_status(label: str) -> str | None:
 
 
 def _history_record_matches(record: DownloadRecord, query: str, filter_label: str) -> bool:
+    if filter_label == "未完成" and record.status == "completed":
+        return False
     expected_status = _history_filter_status(filter_label)
     if expected_status and record.status != expected_status:
         return False

@@ -2110,3 +2110,31 @@ def test_xiaohongshu_has_a_dedicated_ytdlp_extractor() -> None:
     url = "https://www.xiaohongshu.com/explore/deadbeefdeadbeefdeadbeef"
 
     assert m3u8_core._has_specific_ytdlp_extractor(url) is True
+
+
+def test_bulk_history_upsert_retains_unfinished_beyond_completed_limit(tmp_path):
+    store = DownloadHistoryStore(tmp_path / "history.json", limit=10)
+    records = [DownloadRecord(str(i), f"Demo {i}", "direct", "https://example.com/video?demo=hidden",
+                              "example.com", f"demo-{i}.mp4", status, updated_at=i)
+               for i, status in enumerate(["queued"] * 30 + ["failed"] * 30 + ["completed"] * 20)]
+    stored = store.upsert_many(records)
+    assert len(stored) == 70
+    restored = store.load()
+    assert len(restored) == 70
+    assert sum(r.status == "queued" for r in restored) == 30
+    assert sum(r.status == "failed" for r in restored) == 30
+    assert sum(r.status == "completed" for r in restored) == 10
+    assert all("?" not in r.source_url for r in restored)
+    assert len(store.clear_completed()) == 60
+
+
+def test_bulk_history_upsert_merges_other_writer_and_updates_same_id(tmp_path):
+    first = DownloadHistoryStore(tmp_path / "history.json")
+    second = DownloadHistoryStore(first.path)
+    def record(record_id, status):
+        return DownloadRecord(record_id, "Demo", "direct", "https://example.com", "example.com", "demo.mp4", status)
+    first.upsert(record("first", "queued"))
+    second.upsert(record("second", "failed"))
+    result = first.upsert_many([record("first", "completed"), record("third", "queued")])
+    assert {r.record_id: r.status for r in result} == {"first": "completed", "second": "failed", "third": "queued"}
+    assert len(second.load()) == 3
