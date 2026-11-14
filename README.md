@@ -1,12 +1,24 @@
 # Universal Video Downloader for Windows
 
-一个用于学习和研究视频下载流程的 Windows 桌面工具。项目提供 HLS/m3u8、普通视频直链、百度网盘授权分享、PikPak 公开分享和 YouTube 链接的解析与下载能力，重点演示播放列表解析、分片下载、断点续传、音视频合并和桌面客户端交互。
+把获准保存的课程或研究视频链接粘贴到 Windows 桌面端，选择播放列表里的几节课、画质和可用字幕，即可按顺序下载。支持 HLS（m3u8）、视频直链和 yt-dlp 可解析的网页。
 
-> 本项目仅作为学术研究、技术学习和个人合法备份示例开源。请勿用于商业用途，请勿下载、传播或再分发没有授权的内容，请勿规避 DRM、访问控制、付费限制或版权保护机制。
+**[下载 Windows x64 便携版 / Download ZIP][zip]** · [核对 SHA-256][checksum] · [发行说明 / Release notes][release]
 
-当前稳定版本：`v1.2.0`。完整更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+**首次使用**（Windows 10 / 11 x64，稳定版 `v1.2.0`）
 
-## 功能
+1. 下载 ZIP，对照校验文件核实 SHA-256，完整解压后打开 `UniversalVideoDownloader.exe`。
+2. 粘贴链接并点击“解析媒体”。选中需要的视频，确认保存目录、画质和字幕。
+3. 点击“开始下载”或“下载选中项”。需要合并独立的音视频流或嵌入字幕时，请先安装 FFmpeg 并将其加入 `PATH`。
+
+**English quick start.** Download and verify the Windows x64 ZIP, extract the entire folder, and run `UniversalVideoDownloader.exe`. Paste an authorized video or playlist URL, choose **解析媒体** (Analyze), select the items you need, then choose **下载选中项** (Download selected). The optional Chrome/Edge companion can send media from the current tab after you click its detection button.
+
+`main` 源码另含百度网盘授权分享、PikPak 公开分享和队列恢复改进。下文说明当前源码的完整功能。使用范围见[非商业许可证](LICENSE)，版本差异见[更新记录](CHANGELOG.md)。
+
+[zip]: https://github.com/vemodalen-x/universal-video-downloader/releases/download/v1.2.0/UniversalVideoDownloader-v1.2.0-windows-x64.zip
+[checksum]: https://github.com/vemodalen-x/universal-video-downloader/releases/download/v1.2.0/SHA256SUMS-v1.2.0.txt
+[release]: https://github.com/vemodalen-x/universal-video-downloader/releases/tag/v1.2.0
+
+## 源码功能
 
 - 输入网页 URL、百度网盘分享、PikPak 公开分享、`.m3u8` URL、普通视频直链或 YouTube 视频 URL。
 - 识别带四位提取码的百度网盘分享，通过用户已授权的本地连接器转存并下载完整分享目录；下载结果未确认完整时不会标记成功。
